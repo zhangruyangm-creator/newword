@@ -29,7 +29,8 @@ jobs:
           aqt install-qt mac desktop 6.11.0 clang_64 -O "$RUNNER_TEMP/qt"
 
       - name: Configure
-        run: cmake -B build -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/qt/6.11.0/clang_64"
+        # aqt 用 clang_64 架构安装，但 Qt 6.11 的安装目录名仍是 macos
+        run: cmake -B build -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/qt/6.11.0/macos"
 
       - name: Build
         run: cmake --build build -j
