@@ -74,6 +74,8 @@ private slots:
     void debug_pagedEditorPrimitives();
     void pagedEditorWidget_pageBoundaryTyping();
     void pagedEditorWidget_renderAndEdit();
+    void pagedEditorWidget_floatingTextBoxes();
+    void pagedEditorWidget_gridAndColumnResize();
     void docx_modelExporter_roundTrip_plainAndStyled();
     void docx_modelExporter_preservesTable();
     void docx_importer_modelClosedLoop_headingBoldTable();
@@ -1153,6 +1155,137 @@ void CoreSmokeTest::pagedEditorWidget_pageBoundaryTyping()
     verifyNoStraddle("post-edit");
 }
 
+void CoreSmokeTest::pagedEditorWidget_floatingTextBoxes()
+{
+    PageLayoutSettings layout;
+    QTextDocument doc;
+    PagedEditorWidget view(&doc, layout, HeaderFooterSettings{});
+    view.resize(1100, 1500);
+    view.setHtml(QStringLiteral("<p>第一段</p><p>第二段</p>"));
+    view.show();
+
+    FloatingTextBox box = FloatingTextBoxes::makeDefault(0);
+    box.xPt = 60;
+    box.yPt = 60;
+    box.wPt = 200;
+    box.hPt = 100;
+    box.html = QStringLiteral("<p>浮动文字</p>");
+    view.insertFloatingTextBox(box);
+    QCOMPARE(FloatingTextBoxes::load(&doc).size(), 1);
+
+    // The box must be visible in the rendered page (gray border/text pixels).
+    QImage img(view.size(), QImage::Format_ARGB32);
+    img.fill(Qt::transparent);
+    view.render(&img);
+    constexpr qreal k = 96.0 / 72.0;
+    const QPoint boxTopLeft(153 + 96 + qRound(box.xPt * k),
+                            24 + 141 + qRound(box.yPt * k));
+    const QSize boxSize(qRound(box.wPt * k), qRound(box.hPt * k));
+    int darkPixels = 0;
+    for (int y = boxTopLeft.y(); y < boxTopLeft.y() + boxSize.height(); y += 2) {
+        for (int x = boxTopLeft.x(); x < boxTopLeft.x() + boxSize.width(); x += 2) {
+            if (qGray(img.pixel(x, y)) < 230)
+                ++darkPixels;
+        }
+    }
+    QVERIFY2(darkPixels > 20,
+             qPrintable(QStringLiteral("box pixels=%1").arg(darkPixels)));
+
+    // Drag the box: coordinates must change and persist into the document.
+    const QPoint center = boxTopLeft + QPoint(boxSize.width() / 2, boxSize.height() / 2);
+    QMouseEvent press(QEvent::MouseButtonPress, center, center, Qt::LeftButton,
+                      Qt::LeftButton, Qt::NoModifier);
+    QApplication::sendEvent(&view, &press);
+    const QPoint moved = center + QPoint(40, 25);
+    QMouseEvent moveEv(QEvent::MouseMove, moved, moved, Qt::NoButton, Qt::LeftButton,
+                       Qt::NoModifier);
+    QApplication::sendEvent(&view, &moveEv);
+    QMouseEvent release(QEvent::MouseButtonRelease, moved, moved, Qt::LeftButton,
+                        Qt::NoButton, Qt::NoModifier);
+    QApplication::sendEvent(&view, &release);
+    const QVector<FloatingTextBox> afterDrag = FloatingTextBoxes::load(&doc);
+    QCOMPARE(afterDrag.size(), 1);
+    QVERIFY2(afterDrag.first().xPt > box.xPt,
+             qPrintable(QStringLiteral("xPt=%1").arg(afterDrag.first().xPt)));
+    QVERIFY2(afterDrag.first().yPt > box.yPt,
+             qPrintable(QStringLiteral("yPt=%1").arg(afterDrag.first().yPt)));
+
+    // Double-click opens the inline editor; Escape cancels without changes.
+    QMouseEvent dbl(QEvent::MouseButtonDblClick, moved, moved, Qt::LeftButton,
+                    Qt::LeftButton, Qt::NoModifier);
+    QApplication::sendEvent(&view, &dbl);
+    QTextEdit *editor = view.findChild<QTextEdit *>();
+    QVERIFY(editor != nullptr);
+    QVERIFY(editor->isVisible());
+    QKeyEvent esc(QEvent::KeyPress, Qt::Key_Escape, Qt::NoModifier);
+    QApplication::sendEvent(editor, &esc);
+    QVERIFY(!editor->isVisible());
+    QCOMPARE(FloatingTextBoxes::load(&doc).first().html,
+             QStringLiteral("<p>浮动文字</p>"));
+}
+
+void CoreSmokeTest::pagedEditorWidget_gridAndColumnResize()
+{
+    PageLayoutSettings layout;
+
+    // --- Grid lines: light 5mm grid must appear and disappear with the toggle.
+    QTextDocument doc;
+    PagedEditorWidget view(&doc, layout, HeaderFooterSettings{});
+    view.resize(1100, 1500);
+    view.show();
+    auto countGridPixels = [&view]() {
+        QImage img(view.size(), QImage::Format_ARGB32);
+        img.fill(Qt::transparent);
+        view.render(&img);
+        int n = 0;
+        for (int y = 180; y < 990; ++y) {
+            for (int x = 264; x < 836; ++x) {
+                const int g = qGray(img.pixel(x, y));
+                if (g > 205 && g < 245)
+                    ++n;
+            }
+        }
+        return n;
+    };
+    view.setGridLinesVisible(true);
+    QVERIFY2(countGridPixels() > 200, "grid lines should be visible");
+    view.setGridLinesVisible(false);
+    QVERIFY2(countGridPixels() < 50, "grid lines should disappear");
+
+    // --- Table column drag-resize changes and persists column widths.
+    QTextDocument tableDoc;
+    QTextCursor tc(&tableDoc);
+    QTextTable *table = tc.insertTable(2, 3);
+    for (int r = 0; r < 2; ++r) {
+        for (int col = 0; col < 3; ++col) {
+            QTextCursor cell(table->cellAt(r, col).firstCursorPosition());
+            cell.insertText(QStringLiteral("内容"));
+        }
+    }
+    PagedEditorWidget view2(&tableDoc, layout, HeaderFooterSettings{});
+    view2.resize(1100, 1500);
+    const QVector<qreal> before = TableGeometry::columnWidthPercents(table);
+    const QRectF tableRect = tableDoc.documentLayout()->frameBoundingRect(table);
+    const QVector<qreal> edges = TableGeometry::columnEdgeXs(table, tableRect);
+    QVERIFY(edges.size() >= 3);
+    const QPoint borderPos(153 + 96 + qRound(edges.at(1)),
+                           24 + 141 + qRound(tableRect.top()) + 30);
+    QMouseEvent press(QEvent::MouseButtonPress, borderPos, borderPos, Qt::LeftButton,
+                      Qt::LeftButton, Qt::NoModifier);
+    QApplication::sendEvent(&view2, &press);
+    const QPoint moved = borderPos + QPoint(60, 0);
+    QMouseEvent moveEv(QEvent::MouseMove, moved, moved, Qt::NoButton, Qt::LeftButton,
+                       Qt::NoModifier);
+    QApplication::sendEvent(&view2, &moveEv);
+    QMouseEvent release(QEvent::MouseButtonRelease, moved, moved, Qt::LeftButton,
+                        Qt::NoButton, Qt::NoModifier);
+    QApplication::sendEvent(&view2, &release);
+    const QVector<qreal> after = TableGeometry::columnWidthPercents(table);
+    QVERIFY2(qAbs(after.at(0) - before.at(0)) > 1.0,
+             qPrintable(QStringLiteral("before=%1 after=%2")
+                            .arg(before.at(0)).arg(after.at(0))));
+}
+
 void CoreSmokeTest::pagedEditorWidget_renderAndEdit()
 {
     PageLayoutSettings pageLayout;
@@ -1247,6 +1380,14 @@ void CoreSmokeTest::pagedEditorWidget_renderAndEdit()
     const QString text = doc.toPlainText();
     QVERIFY(text.contains(QStringLiteral("你")));
     QVERIFY(!text.contains(QStringLiteral("nihao")));
+    // Committed text must NOT inherit the IME preedit underline.
+    const int committedPos = text.indexOf(QStringLiteral("你"));
+    QVERIFY(committedPos >= 0);
+    QTextCursor formatCursor(&doc);
+    formatCursor.setPosition(committedPos + 1);
+    QVERIFY2(formatCursor.charFormat().underlineStyle() == QTextCharFormat::NoUnderline,
+             qPrintable(QStringLiteral("underlineStyle=%1")
+                            .arg(int(formatCursor.charFormat().underlineStyle()))));
 
     // 6) Undo / redo through the widget.
     view.undo();

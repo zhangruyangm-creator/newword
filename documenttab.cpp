@@ -1,6 +1,7 @@
 #include "documenttab.h"
 #include "appstyle.h"
 #include "documentrecovery.h" // EditorDefaults
+#include "floatingtextbox.h"
 #include "formularenderer.h"
 #include "outlineviewwidget.h"
 #include "pagegeometry.h"
@@ -78,6 +79,16 @@ DocumentTab::DocumentTab(QWidget *parent)
             &DocumentTab::insertImageFile);
     connect(m_editor, &PagedEditorWidget::scrolled, this, [this]() { syncRuler(); });
     connect(m_editor, &PagedEditorWidget::pageGeometryChanged, this, [this]() { syncRuler(); });
+    connect(m_editor, &PagedEditorWidget::floatingBoxesChanged, this, [this]() {
+        emit contentsChanged();
+        emit modificationChanged(m_editor->document()->isModified());
+    });
+    connect(m_editor, &PagedEditorWidget::imageDoubleClicked, this, [this](int pos) {
+        QString latex;
+        int formulaPos = -1;
+        if (findFormulaAt(pos, &latex, &formulaPos))
+            emit editFormulaRequested(latex, formulaPos);
+    });
     connect(m_outlineView, &OutlineViewWidget::documentEdited, this, [this]() {
         m_editor->document()->setModified(true);
         emit contentsChanged();
@@ -122,29 +133,7 @@ DocumentTab::DocumentTab(QWidget *parent)
                 QTextCursor formulaCursor = m_editor->cursorForPosition(pos);
                 QString formulaLatex;
                 int formulaPos = -1;
-                auto tryFormulaAt = [&](int docPos) {
-                    if (docPos < 0)
-                        return false;
-                    QTextBlock block = m_editor->document()->findBlock(docPos);
-                    for (auto it = block.begin(); !(it.atEnd()); ++it) {
-                        const QTextFragment frag = it.fragment();
-                        if (!frag.isValid() || !frag.charFormat().isImageFormat())
-                            continue;
-                        const int start = frag.position();
-                        const int end = start + frag.length();
-                        if (docPos < start || docPos >= end)
-                            continue;
-                        const QString name = frag.charFormat().toImageFormat().name();
-                        if (!FormulaRenderer::isFormulaResource(name))
-                            continue;
-                        formulaLatex = FormulaRenderer::latexFromResourceName(name);
-                        formulaPos = start;
-                        return true;
-                    }
-                    return false;
-                };
-                if (!tryFormulaAt(formulaCursor.position()) && formulaCursor.position() > 0)
-                    tryFormulaAt(formulaCursor.position() - 1);
+                findFormulaAt(formulaCursor.position(), &formulaLatex, &formulaPos);
                 if (!formulaLatex.isEmpty()) {
                     menu->addSeparator();
                     QAction *editFormula = menu->addAction(tr("编辑公式…"));
@@ -159,6 +148,39 @@ DocumentTab::DocumentTab(QWidget *parent)
             });
 
     setViewMode(DocumentViewMode::Page);
+    reloadFloatingTextBoxes();
+}
+
+bool DocumentTab::findFormulaAt(int pos, QString *latex, int *formulaPos)
+{
+    if (pos < 0)
+        return false;
+    auto tryFormulaAt = [&](int docPos) {
+        if (docPos < 0)
+            return false;
+        QTextBlock block = m_editor->document()->findBlock(docPos);
+        for (auto it = block.begin(); !(it.atEnd()); ++it) {
+            const QTextFragment frag = it.fragment();
+            if (!frag.isValid() || !frag.charFormat().isImageFormat())
+                continue;
+            const int start = frag.position();
+            const int end = start + frag.length();
+            if (docPos < start || docPos >= end)
+                continue;
+            const QString name = frag.charFormat().toImageFormat().name();
+            if (!FormulaRenderer::isFormulaResource(name))
+                continue;
+            if (latex)
+                *latex = FormulaRenderer::latexFromResourceName(name);
+            if (formulaPos)
+                *formulaPos = start;
+            return true;
+        }
+        return false;
+    };
+    if (tryFormulaAt(pos))
+        return true;
+    return pos > 0 && tryFormulaAt(pos - 1);
 }
 
 DocumentTab::~DocumentTab() = default;
@@ -322,7 +344,8 @@ void DocumentTab::setRulerVisible(bool visible)
 void DocumentTab::setGridLinesVisible(bool visible)
 {
     m_showGridLines = visible;
-    // Grid overlay is not implemented in the self-drawn editor yet.
+    if (m_editor)
+        m_editor->setGridLinesVisible(visible);
 }
 
 void DocumentTab::updateRulerVisibility()
@@ -345,13 +368,18 @@ void DocumentTab::syncRuler()
 
 void DocumentTab::insertFloatingTextBox()
 {
-    // Floating text boxes are not rendered by the self-drawn editor yet;
-    // their data still round-trips through the document for file compatibility.
+    if (!m_editor)
+        return;
+    if (m_viewMode != DocumentViewMode::Page)
+        setViewMode(DocumentViewMode::Page);
+    m_editor->insertFloatingTextBox(
+        FloatingTextBoxes::makeDefault(m_editor->currentPageIndex()));
 }
 
 void DocumentTab::reloadFloatingTextBoxes()
 {
-    // No-op while the floating box layer is disabled.
+    if (m_editor)
+        m_editor->reloadFloatingTextBoxes();
 }
 
 void DocumentTab::refreshTheme()

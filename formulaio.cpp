@@ -104,6 +104,7 @@ void replaceHitsDescending(QTextDocument *document, QList<FormulaHit> hits, qrea
         const qreal imageDpr = qMax<qreal>(1.0, hit.image.devicePixelRatio());
         fmt.setWidth(hit.image.width() / imageDpr);
         fmt.setHeight(hit.image.height() / imageDpr);
+        fmt.setVerticalAlignment(QTextCharFormat::AlignMiddle);
 
         if (asDataUrl) {
             QByteArray bytes;

@@ -118,6 +118,8 @@ protected:
     void resizeEvent(QResizeEvent *event) override;
 
 private:
+    //! Locate a formula image at/near a document position.
+    bool findFormulaAt(int pos, QString *latex, int *formulaPos);
     void updateRulerVisibility();
     void syncRuler();
     void placeEditorInPageFrame();

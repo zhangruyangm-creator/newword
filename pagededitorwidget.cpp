@@ -2,6 +2,7 @@
 
 #include "appstyle.h"
 #include "pagegeometry.h"
+#include "tablegeometry.h"
 
 #include <QAbstractTextDocumentLayout>
 #include <QApplication>
@@ -26,10 +27,13 @@
 #include <QTextBlock>
 #include <QTextDocument>
 #include <QTextDocumentFragment>
+#include <QTextEdit>
+#include <QTextFragment>
 #include <QTextImageFormat>
 #include <QTextObjectInterface>
 #include <QTextLayout>
 #include <QTextLine>
+#include <QTextTable>
 #include <QTimer>
 #include <QUrl>
 #include <QWheelEvent>
@@ -503,6 +507,324 @@ void PagedEditorWidget::downscaleImageResources(QTextDocument *document)
     }
 }
 
+void PagedEditorWidget::reloadFloatingTextBoxes()
+{
+    m_floatBoxes = FloatingTextBoxes::load(m_document);
+    m_floatBoxDocs.clear();
+    if (!m_selectedBoxId.isEmpty() && indexOfFloatingBox(m_selectedBoxId) < 0)
+        m_selectedBoxId.clear();
+    closeBoxEditor();
+    update();
+}
+
+void PagedEditorWidget::insertFloatingTextBox(const FloatingTextBox &box)
+{
+    m_floatBoxes.append(box);
+    saveFloatingBoxes();
+    m_selectedBoxId = box.id;
+    update();
+}
+
+void PagedEditorWidget::removeFloatingTextBox(const QString &id)
+{
+    const int idx = indexOfFloatingBox(id);
+    if (idx < 0)
+        return;
+    closeBoxEditor();
+    m_floatBoxes.removeAt(idx);
+    m_floatBoxDocs.remove(id);
+    if (m_selectedBoxId == id)
+        m_selectedBoxId.clear();
+    saveFloatingBoxes();
+}
+
+void PagedEditorWidget::saveFloatingBoxes()
+{
+    if (!m_document)
+        return;
+    FloatingTextBoxes::save(m_document, m_floatBoxes, true);
+    update();
+    emit floatingBoxesChanged();
+}
+
+int PagedEditorWidget::indexOfFloatingBox(const QString &id) const
+{
+    for (int i = 0; i < m_floatBoxes.size(); ++i) {
+        if (m_floatBoxes.at(i).id == id)
+            return i;
+    }
+    return -1;
+}
+
+QRectF PagedEditorWidget::floatBoxRectInWidget(const FloatingTextBox &box) const
+{
+    const qreal f = zoomScale();
+    constexpr qreal kPtToPx = 96.0 / 72.0;
+    const int page = qBound(0, box.pageIndex, qMax(0, m_pageCount - 1));
+    const QRectF content = contentRectInWidget(page);
+    return QRectF(content.left() + box.xPt * kPtToPx * f,
+                  content.top() + box.yPt * kPtToPx * f,
+                  box.wPt * kPtToPx * f,
+                  box.hPt * kPtToPx * f);
+}
+
+int PagedEditorWidget::hitTestFloatingBox(const QPoint &widgetPos) const
+{
+    for (int i = m_floatBoxes.size() - 1; i >= 0; --i) {
+        if (floatBoxRectInWidget(m_floatBoxes.at(i)).adjusted(-2, -2, 2, 2)
+                .contains(widgetPos)) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+void PagedEditorWidget::paintFloatingBoxes(QPainter *painter, int pageIndex)
+{
+    for (int i = 0; i < m_floatBoxes.size(); ++i) {
+        const FloatingTextBox &box = m_floatBoxes.at(i);
+        if (box.pageIndex != pageIndex)
+            continue;
+        const QRectF r = floatBoxRectInWidget(box);
+        painter->fillRect(r, QColor(255, 255, 255, 238));
+
+        const bool selected = box.id == m_selectedBoxId;
+        QPen pen(selected ? QColor(110, 118, 132) : QColor(198, 202, 210), 1.0);
+        pen.setCosmetic(true);
+        if (!selected) {
+            pen.setStyle(Qt::DashLine);
+            pen.setDashPattern({3.0, 2.5});
+        }
+        painter->setPen(pen);
+        painter->setBrush(Qt::NoBrush);
+        painter->drawRect(r.adjusted(0.5, 0.5, -0.5, -0.5));
+
+        const QRectF content = r.adjusted(3, 3, -3, -3);
+        if (content.width() > 10 && content.height() > 10) {
+            QTextDocument *boxDoc = m_floatBoxDocs.value(box.id);
+            if (!boxDoc) {
+                boxDoc = new QTextDocument(this);
+                boxDoc->setDocumentMargin(0);
+                boxDoc->setHtml(box.html);
+                m_floatBoxDocs.insert(box.id, boxDoc);
+            }
+            boxDoc->setPageSize(content.size());
+            painter->save();
+            painter->setClipRect(content);
+            painter->translate(content.topLeft());
+            QAbstractTextDocumentLayout::PaintContext ctx;
+            ctx.palette = palette();
+            boxDoc->documentLayout()->draw(painter, ctx);
+            painter->restore();
+        }
+
+        if (selected) {
+            painter->fillRect(QRectF(r.right() - 7, r.bottom() - 7, 7, 7),
+                              QColor(150, 156, 168));
+        }
+    }
+}
+
+void PagedEditorWidget::setGridLinesVisible(bool visible)
+{
+    if (m_showGrid == visible)
+        return;
+    m_showGrid = visible;
+    update();
+}
+
+void PagedEditorWidget::paintGridLines(QPainter *painter, const QRectF &contentRect)
+{
+    if (!m_showGrid || contentRect.width() < 8 || contentRect.height() < 8)
+        return;
+    const qreal step = m_gridSpacingPx * zoomScale();
+    painter->save();
+    painter->setPen(QPen(QColor(190, 198, 210, 110), 1));
+    for (qreal x = contentRect.left(); x <= contentRect.right(); x += step) {
+        painter->drawLine(QPointF(x, contentRect.top()), QPointF(x, contentRect.bottom()));
+    }
+    for (qreal y = contentRect.top(); y <= contentRect.bottom(); y += step) {
+        painter->drawLine(QPointF(contentRect.left(), y), QPointF(contentRect.right(), y));
+    }
+    painter->restore();
+}
+
+int PagedEditorWidget::hitTestColumnBorder(const QPoint &widgetPos, QTextTable **tableOut,
+                                           QRectF *tableRectOut) const
+{
+    if (tableOut)
+        *tableOut = nullptr;
+    if (tableRectOut)
+        *tableRectOut = {};
+    if (!m_document || m_readOnly)
+        return -1;
+
+    QTextCursor cursor = cursorForPosition(widgetPos);
+    QTextTable *table = cursor.currentTable();
+    if (!table || table->columns() < 2)
+        return -1;
+
+    auto *layout = m_document->documentLayout();
+    const QRectF tableRect = layout->frameBoundingRect(table);
+    if (!tableRect.isValid() || tableRect.height() < 2.0)
+        return -1;
+
+    const QPointF docPos = documentPointAt(widgetPos);
+    constexpr qreal kYPad = 2.0;
+    if (docPos.y() < tableRect.top() - kYPad || docPos.y() > tableRect.bottom() + kYPad)
+        return -1;
+
+    const QVector<qreal> edges = TableGeometry::columnEdgeXs(table, tableRect);
+    if (edges.size() < 3)
+        return -1;
+
+    // Tolerance in widget pixels, converted to doc units for the current zoom.
+    const qreal kTolerance = 5.0 / qMax(0.25, zoomScale());
+    int best = -1;
+    qreal bestDist = kTolerance;
+    // Internal borders only (between columns).
+    for (int i = 1; i + 1 < edges.size(); ++i) {
+        const qreal dist = qAbs(docPos.x() - edges.at(i));
+        if (dist <= bestDist) {
+            bestDist = dist;
+            best = i - 1; // border after column
+        }
+    }
+    if (best < 0)
+        return -1;
+
+    if (tableOut)
+        *tableOut = table;
+    if (tableRectOut)
+        *tableRectOut = tableRect;
+    return best;
+}
+
+void PagedEditorWidget::updateColumnResizeCursor(const QPoint &widgetPos)
+{
+    if (m_columnResize.active)
+        return;
+    QTextTable *table = nullptr;
+    const int border = hitTestColumnBorder(widgetPos, &table);
+    const bool hover = border >= 0 && table;
+    if (hover)
+        setCursor(Qt::SplitHCursor);
+    else if (m_hoveringColumnBorder)
+        unsetCursor();
+    m_hoveringColumnBorder = hover;
+}
+
+void PagedEditorWidget::applyColumnResizeDrag(const QPoint &widgetPos)
+{
+    if (!m_columnResize.active || !m_columnResize.table)
+        return;
+    if (m_columnResize.tableWidth < 8.0)
+        return;
+
+    const QPointF docPos = documentPointAt(widgetPos);
+    const qreal deltaPx = docPos.x() - m_columnResize.startDocX;
+    const qreal deltaPct = deltaPx / m_columnResize.tableWidth * 100.0;
+
+    QVector<qreal> percents = m_columnResize.startPercents;
+    const int left = m_columnResize.borderAfterColumn;
+    const int right = left + 1;
+    if (left < 0 || right >= percents.size())
+        return;
+
+    constexpr qreal kMinPct = 5.0;
+    qreal leftPct = m_columnResize.startPercents.at(left) + deltaPct;
+    qreal rightPct = m_columnResize.startPercents.at(right) - deltaPct;
+    if (leftPct < kMinPct) {
+        rightPct -= (kMinPct - leftPct);
+        leftPct = kMinPct;
+    }
+    if (rightPct < kMinPct) {
+        leftPct -= (kMinPct - rightPct);
+        rightPct = kMinPct;
+    }
+    if (leftPct < kMinPct || rightPct < kMinPct)
+        return;
+
+    percents[left] = leftPct;
+    percents[right] = rightPct;
+    TableGeometry::setColumnWidthPercents(m_columnResize.table, percents);
+    m_columnResize.guideDocX = docPos.x();
+    update();
+}
+
+void PagedEditorWidget::openBoxEditor(const QString &id)
+{
+    if (m_readOnly)
+        return;
+    const int idx = indexOfFloatingBox(id);
+    if (idx < 0)
+        return;
+    if (!m_boxEditor) {
+        m_boxEditor = new QTextEdit(this);
+        m_boxEditor->setFrameShape(QFrame::NoFrame);
+        m_boxEditor->setStyleSheet(QStringLiteral(
+            "QTextEdit { background: white; border: 1px solid #8a93a3; }"));
+        m_boxEditor->installEventFilter(this);
+        m_boxEditor->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+        m_boxEditor->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+        m_boxEditor->hide();
+    }
+    m_editingBoxId = id;
+    const FloatingTextBox &box = m_floatBoxes.at(idx);
+    m_boxEditor->setGeometry(floatBoxRectInWidget(box).toRect().adjusted(1, 1, -1, -1));
+    m_boxEditor->setHtml(box.html);
+    m_boxEditor->show();
+    m_boxEditor->raise();
+    m_boxEditor->setFocus();
+}
+
+void PagedEditorWidget::commitBoxEditor()
+{
+    if (!m_boxEditor || m_editingBoxId.isEmpty())
+        return;
+    const int idx = indexOfFloatingBox(m_editingBoxId);
+    if (idx >= 0) {
+        m_floatBoxes[idx].html = m_boxEditor->toHtml();
+        m_floatBoxDocs.remove(m_editingBoxId);
+        saveFloatingBoxes();
+    }
+    m_editingBoxId.clear();
+    m_boxEditor->hide();
+}
+
+void PagedEditorWidget::closeBoxEditor()
+{
+    if (!m_boxEditor)
+        return;
+    m_editingBoxId.clear();
+    m_boxEditor->hide();
+}
+
+bool PagedEditorWidget::eventFilter(QObject *watched, QEvent *event)
+{
+    if (watched == m_boxEditor) {
+        if (event->type() == QEvent::FocusOut) {
+            commitBoxEditor();
+            return false;
+        }
+        if (event->type() == QEvent::KeyPress) {
+            auto *keyEvent = static_cast<QKeyEvent *>(event);
+            if (keyEvent->key() == Qt::Key_Escape) {
+                closeBoxEditor();
+                setFocus();
+                return true;
+            }
+            if (keyEvent->key() == Qt::Key_Return
+                && (keyEvent->modifiers() & Qt::ControlModifier)) {
+                commitBoxEditor();
+                setFocus();
+                return true;
+            }
+        }
+    }
+    return QWidget::eventFilter(watched, event);
+}
+
 void PagedEditorWidget::setPlainText(const QString &text)
 {
     if (!m_document)
@@ -755,6 +1077,38 @@ void PagedEditorWidget::wheelEvent(QWheelEvent *event)
 void PagedEditorWidget::mousePressEvent(QMouseEvent *event)
 {
     if (event->button() == Qt::LeftButton) {
+        const int boxIdx = hitTestFloatingBox(event->pos());
+        if (boxIdx >= 0 && !m_readOnly) {
+            m_selectedBoxId = m_floatBoxes.at(boxIdx).id;
+            m_boxDragOrig = m_floatBoxes.at(boxIdx);
+            m_boxDragStart = event->pos();
+            const QRectF r = floatBoxRectInWidget(m_boxDragOrig);
+            m_boxDragResize =
+                QRectF(r.right() - 14, r.bottom() - 14, 14, 14).contains(event->pos());
+            m_boxDragMove = !m_boxDragResize;
+            m_dragging = false;
+            update();
+            event->accept();
+            return;
+        }
+        QTextTable *table = nullptr;
+        QRectF tableRect;
+        const int border = hitTestColumnBorder(event->pos(), &table, &tableRect);
+        if (border >= 0 && table) {
+            m_columnResize.active = true;
+            m_columnResize.table = table;
+            m_columnResize.borderAfterColumn = border;
+            m_columnResize.startPercents = TableGeometry::columnWidthPercents(table);
+            m_columnResize.startDocX = documentPointAt(event->pos()).x();
+            m_columnResize.tableWidth = tableRect.width();
+            m_columnResize.guideDocX = m_columnResize.startDocX;
+            setCursor(Qt::SplitHCursor);
+            m_dragging = false;
+            event->accept();
+            return;
+        }
+        m_selectedBoxId.clear();
+        update();
         m_hasSelectionDrag = true;
         m_dragging = true;
         m_lastMousePos = event->pos();
@@ -768,6 +1122,33 @@ void PagedEditorWidget::mousePressEvent(QMouseEvent *event)
 void PagedEditorWidget::mouseMoveEvent(QMouseEvent *event)
 {
     m_lastMousePos = event->pos();
+    if (m_columnResize.active) {
+        applyColumnResizeDrag(event->pos());
+        event->accept();
+        return;
+    }
+    if (m_boxDragMove || m_boxDragResize) {
+        const int idx = indexOfFloatingBox(m_selectedBoxId);
+        if (idx >= 0) {
+            const qreal f = zoomScale();
+            constexpr qreal kPtToPx = 96.0 / 72.0;
+            const qreal inv = 1.0 / (kPtToPx * f);
+            const QPointF delta = (event->pos() - m_boxDragStart) * inv;
+            FloatingTextBox &box = m_floatBoxes[idx];
+            if (m_boxDragMove) {
+                box.xPt = qMax(0.0, m_boxDragOrig.xPt + delta.x());
+                box.yPt = qMax(0.0, m_boxDragOrig.yPt + delta.y());
+            } else {
+                box.wPt = qMax(30.0, m_boxDragOrig.wPt + delta.x());
+                box.hPt = qMax(20.0, m_boxDragOrig.hPt + delta.y());
+            }
+            update();
+        }
+        event->accept();
+        return;
+    }
+    if (!m_dragging)
+        updateColumnResizeCursor(event->pos());
     if (m_dragging && m_hasSelectionDrag) {
         setCursorFromWidget(event->pos(), true);
         const bool nearEdge = event->pos().y() < kEdgeAutoScrollPx
@@ -785,6 +1166,20 @@ void PagedEditorWidget::mouseMoveEvent(QMouseEvent *event)
 void PagedEditorWidget::mouseReleaseEvent(QMouseEvent *event)
 {
     if (event->button() == Qt::LeftButton) {
+        if (m_columnResize.active) {
+            applyColumnResizeDrag(event->pos());
+            m_columnResize = {};
+            updateColumnResizeCursor(event->pos());
+            event->accept();
+            return;
+        }
+        if (m_boxDragMove || m_boxDragResize) {
+            m_boxDragMove = false;
+            m_boxDragResize = false;
+            saveFloatingBoxes();
+            event->accept();
+            return;
+        }
         m_dragging = false;
         m_autoScrollTimer->stop();
         event->accept();
@@ -793,10 +1188,46 @@ void PagedEditorWidget::mouseReleaseEvent(QMouseEvent *event)
     }
 }
 
+void PagedEditorWidget::leaveEvent(QEvent *event)
+{
+    if (!m_columnResize.active && m_hoveringColumnBorder) {
+        unsetCursor();
+        m_hoveringColumnBorder = false;
+    }
+    QWidget::leaveEvent(event);
+}
+
 void PagedEditorWidget::mouseDoubleClickEvent(QMouseEvent *event)
 {
     if (event->button() != Qt::LeftButton) {
         event->ignore();
+        return;
+    }
+    const int boxIdx = hitTestFloatingBox(event->pos());
+    if (boxIdx >= 0) {
+        m_selectedBoxId = m_floatBoxes.at(boxIdx).id;
+        openBoxEditor(m_selectedBoxId);
+        update();
+        event->accept();
+        return;
+    }
+    const QTextCursor clickCursor = cursorForPosition(event->pos());
+    const int hitPos = clickCursor.position();
+    auto isImageAt = [&](int p) -> bool {
+        if (p < 0 || !m_document)
+            return false;
+        const QTextBlock b = m_document->findBlock(p);
+        for (auto it = b.begin(); !it.atEnd(); ++it) {
+            const QTextFragment f = it.fragment();
+            if (f.charFormat().isImageFormat() && p >= f.position()
+                && p < f.position() + f.length())
+                return true;
+        }
+        return false;
+    };
+    if (isImageAt(hitPos) || isImageAt(hitPos - 1)) {
+        emit imageDoubleClicked(hitPos);
+        event->accept();
         return;
     }
     setCursorFromWidget(event->pos(), false);
@@ -817,6 +1248,14 @@ void PagedEditorWidget::keyPressEvent(QKeyEvent *event)
     const int key = event->key();
     const Qt::KeyboardModifiers mods = event->modifiers();
     const QString text = event->text();
+
+    if (key == Qt::Key_Delete && !m_selectedBoxId.isEmpty()
+        && (!m_boxEditor || !m_boxEditor->isVisible())) {
+        removeFloatingTextBox(m_selectedBoxId);
+        m_selectedBoxId.clear();
+        event->accept();
+        return;
+    }
 
     if (m_readOnly) {
         const bool editing = key == Qt::Key_Backspace || key == Qt::Key_Delete
@@ -966,11 +1405,23 @@ void PagedEditorWidget::inputMethodEvent(QInputMethodEvent *event)
         event->accept();
         return;
     }
+    const bool composing = m_preeditLength > 0;
     removePreedit();
     if (!event->preeditString().isEmpty())
         insertPreedit(event->preeditString());
-    if (!event->commitString().isEmpty())
-        insertText(event->commitString());
+    if (!event->commitString().isEmpty()) {
+        if (composing) {
+            // Commit with the format captured before composition started, so the
+            // IME underline never leaks into committed text.
+            QTextCursor c = m_cursor;
+            if (c.hasSelection())
+                c.removeSelectedText();
+            c.insertText(event->commitString(), m_preeditBaseFormat);
+            m_cursor = c;
+        } else {
+            insertText(event->commitString());
+        }
+    }
     afterCursorMove();
     event->accept();
 }
@@ -1022,6 +1473,21 @@ void PagedEditorWidget::focusOutEvent(QFocusEvent *event)
 
 void PagedEditorWidget::contextMenuEvent(QContextMenuEvent *event)
 {
+    const int boxIdx = hitTestFloatingBox(event->pos());
+    if (boxIdx >= 0) {
+        m_selectedBoxId = m_floatBoxes.at(boxIdx).id;
+        update();
+        QMenu menu(this);
+        QAction *edit = menu.addAction(tr("编辑文字"));
+        QAction *del = menu.addAction(tr("删除文本框"));
+        QAction *chosen = menu.exec(event->globalPos());
+        if (chosen == edit)
+            openBoxEditor(m_selectedBoxId);
+        else if (chosen == del)
+            removeFloatingTextBox(m_selectedBoxId);
+        event->accept();
+        return;
+    }
     if (contextMenuPolicy() == Qt::CustomContextMenu) {
         event->accept();
         QWidget::contextMenuEvent(event); // emits customContextMenuRequested(pos)
@@ -1538,6 +2004,10 @@ void PagedEditorWidget::drawPage(QPainter *painter, int pageIndex)
             painter->restore();
         }
     }
+
+    if (m_pageMode)
+        paintGridLines(painter, cr);
+    paintFloatingBoxes(painter, pageIndex);
 }
 
 void PagedEditorWidget::drawHeaderFooter(QPainter *painter, int pageIndex,
@@ -1628,6 +2098,10 @@ void PagedEditorWidget::insertPreedit(const QString &text)
 {
     if (text.isEmpty())
         return;
+    // The preedit is underlined; remember the format at the cursor BEFORE the
+    // composition so committed text does not inherit the underline.
+    if (m_preeditLength == 0)
+        m_preeditBaseFormat = m_cursor.charFormat();
     QTextCursor c = m_cursor;
     c.insertText(text, preeditFormat(palette()));
     m_preeditLength = text.length();
@@ -1636,6 +2110,8 @@ void PagedEditorWidget::insertPreedit(const QString &text)
 
 void PagedEditorWidget::scrollBy(int deltaY)
 {
+    if (m_boxEditor && m_boxEditor->isVisible())
+        commitBoxEditor();
     m_vScroll->setValue(m_vScroll->value() + deltaY);
 }
 
@@ -1660,7 +2136,10 @@ void PagedEditorWidget::afterCursorMove()
         emit copyAvailable(hasSelection);
         emit selectionChanged();
     }
-    m_currentCharFormat = m_cursor.charFormat();
+    // While composing, the format at the cursor is the underlined preedit —
+    // keep the pre-composition format so commits stay clean.
+    if (m_preeditLength == 0)
+        m_currentCharFormat = m_cursor.charFormat();
     emit currentCharFormatChanged(currentCharFormat());
 }
 

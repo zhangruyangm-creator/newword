@@ -572,6 +572,37 @@ QImage FormulaRenderer::render(const QString &latex, qreal pointSize, qreal dpr)
     if (box.draw)
         box.draw(painter, pad, baseline);
     painter.end();
+
+    // The parser's box height can include phantom space (e.g. superscript font
+    // metrics), leaving the glyphs stuck to the top of a tall image. Trim the
+    // transparent margins so formulas hug their glyphs and center on the line.
+    int minX = w;
+    int minY = h;
+    int maxX = -1;
+    int maxY = -1;
+    const uchar *bits = image.constBits();
+    const int stride = image.bytesPerLine();
+    for (int yy = 0; yy < h; ++yy) {
+        const uchar *row = bits + yy * stride;
+        for (int xx = 0; xx < w; ++xx) {
+            if (row[xx * 4 + 3] > 8) {
+                minX = qMin(minX, xx);
+                maxX = qMax(maxX, xx);
+                minY = qMin(minY, yy);
+                maxY = qMax(maxY, yy);
+            }
+        }
+    }
+    if (maxX >= minX) {
+        const int padPx = qMax(1, qRound(dpr * 2.0));
+        const int x0 = qMax(0, minX - padPx);
+        const int y0 = qMax(0, minY - padPx);
+        const int x1 = qMin(w, maxX + 1 + padPx);
+        const int y1 = qMin(h, maxY + 1 + padPx);
+        QImage cropped = image.copy(x0, y0, x1 - x0, y1 - y0);
+        cropped.setDevicePixelRatio(dpr);
+        return cropped;
+    }
     return image;
 }
 

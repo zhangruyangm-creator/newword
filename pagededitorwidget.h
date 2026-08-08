@@ -1,9 +1,12 @@
 #ifndef PAGEDEDITORWIDGET_H
 #define PAGEDEDITORWIDGET_H
 
+#include "floatingtextbox.h"
 #include "headerfootersettings.h"
 #include "pagelayout.h"
 
+#include <QHash>
+#include <QPointer>
 #include <QTextCharFormat>
 #include <QTextDocument>
 #include <QTextCursor>
@@ -16,6 +19,7 @@ class QMenu;
 class PagedImageObject;
 class QScrollBar;
 class QTextDocument;
+class QTextTable;
 class QTimer;
 
 //! Self-drawn, truly paginated text editor (Word-style print layout).
@@ -55,6 +59,14 @@ public:
     static void normalizeDocumentStructure(QTextDocument *document);
     //! Cap oversized image resources so memory and paint cost stay bounded.
     static void downscaleImageResources(QTextDocument *document);
+    //! Floating text boxes (overlay objects anchored to pages).
+    void reloadFloatingTextBoxes();
+    void insertFloatingTextBox(const FloatingTextBox &box);
+    void removeFloatingTextBox(const QString &id);
+    //! 5 mm grid overlay (page view helper).
+    void setGridLinesVisible(bool visible);
+    [[nodiscard]] bool gridLinesVisible() const { return m_showGrid; }
+    void setGridSpacingPx(int spacingPx) { m_gridSpacingPx = qMax(4, spacingPx); }
 
     void undo();
     void redo();
@@ -113,6 +125,8 @@ signals:
     void imageDropped(const QString &filePath);
     void scrolled();
     void pageGeometryChanged();
+    void floatingBoxesChanged();
+    void imageDoubleClicked(int documentPosition);
 
 protected:
     void paintEvent(QPaintEvent *event) override;
@@ -128,10 +142,12 @@ protected:
     void focusInEvent(QFocusEvent *event) override;
     void focusOutEvent(QFocusEvent *event) override;
     void contextMenuEvent(QContextMenuEvent *event) override;
+    void leaveEvent(QEvent *event) override;
     void showEvent(QShowEvent *event) override;
     void dragEnterEvent(QDragEnterEvent *event) override;
     void dragMoveEvent(QDragMoveEvent *event) override;
     void dropEvent(QDropEvent *event) override;
+    bool eventFilter(QObject *watched, QEvent *event) override;
 
 private:
     void updateMetrics();
@@ -157,6 +173,11 @@ private:
 
     void drawPage(QPainter *painter, int pageIndex);
     void drawHeaderFooter(QPainter *painter, int pageIndex, const QRectF &pageRect);
+    void paintGridLines(QPainter *painter, const QRectF &contentRect);
+    [[nodiscard]] int hitTestColumnBorder(const QPoint &widgetPos, QTextTable **tableOut,
+                                          QRectF *tableRectOut = nullptr) const;
+    void updateColumnResizeCursor(const QPoint &widgetPos);
+    void applyColumnResizeDrag(const QPoint &widgetPos);
 
     void moveCursor(QTextCursor::MoveOperation op, QTextCursor::MoveMode mode, int n = 1);
     void insertText(const QString &text);
@@ -169,6 +190,14 @@ private:
     void afterDocumentChange();
     void applyContinuousLayout();
     void updateEditRegion();
+    void paintFloatingBoxes(QPainter *painter, int pageIndex);
+    [[nodiscard]] int hitTestFloatingBox(const QPoint &widgetPos) const;
+    [[nodiscard]] QRectF floatBoxRectInWidget(const FloatingTextBox &box) const;
+    [[nodiscard]] int indexOfFloatingBox(const QString &id) const;
+    void saveFloatingBoxes();
+    void openBoxEditor(const QString &id);
+    void commitBoxEditor();
+    void closeBoxEditor();
     [[nodiscard]] qreal zoomScale() const;
 
     QTextDocument *m_document = nullptr;
@@ -176,6 +205,7 @@ private:
     HeaderFooterSettings m_headerFooter;
     QTextCursor m_cursor;
     QTextCharFormat m_currentCharFormat;
+    QTextCharFormat m_preeditBaseFormat; //!< format captured before composition starts
     PagedImageObject *m_imageObject = nullptr;
     QScrollBar *m_vScroll = nullptr;
     QTimer *m_blinkTimer = nullptr;
@@ -218,6 +248,31 @@ private:
     mutable QVector<PageRange> m_pageRanges;
     mutable QVector<int> m_pageStartBlocks; //!< first block number per page
     mutable int m_rangeBuiltToPage = -1;    //!< pages [0..this] are accurate
+
+    QVector<FloatingTextBox> m_floatBoxes;
+    QHash<QString, QTextDocument *> m_floatBoxDocs;
+    QString m_selectedBoxId;
+    QString m_editingBoxId;
+    class QTextEdit *m_boxEditor = nullptr;
+    FloatingTextBox m_boxDragOrig;
+    QPoint m_boxDragStart;
+    bool m_boxDragMove = false;
+    bool m_boxDragResize = false;
+
+    bool m_showGrid = false;
+    int m_gridSpacingPx = 19; //!< 5 mm at 100% zoom
+    bool m_hoveringColumnBorder = false;
+
+    struct ColumnResizeSession {
+        bool active = false;
+        QPointer<QTextTable> table;
+        int borderAfterColumn = -1;
+        QVector<qreal> startPercents;
+        qreal startDocX = 0;
+        qreal tableWidth = 0;
+        qreal guideDocX = 0;
+    };
+    ColumnResizeSession m_columnResize;
 };
 
 #endif // PAGEDEDITORWIDGET_H

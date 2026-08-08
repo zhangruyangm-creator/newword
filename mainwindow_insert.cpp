@@ -160,6 +160,9 @@ void insertFormulaImage(PagedEditorWidget *editor, const QString &latex, qreal p
     imageFormat.setName(name);
     imageFormat.setWidth(image.width() / dpr);
     imageFormat.setHeight(image.height() / dpr);
+    // Center formulas on the text line (Qt default is bottom-on-baseline,
+    // which makes tall formulas stick up above the text).
+    imageFormat.setVerticalAlignment(QTextCharFormat::AlignMiddle);
     imageFormat.setProperty(FormulaIO::PointSizeProperty, pointSize);
     imageFormat.setProperty(QTextFormat::ImageAltText, FormulaIO::makeLatexAlt(latex));
 

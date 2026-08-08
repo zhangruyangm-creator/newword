@@ -106,6 +106,7 @@ void DocumentTab::loadRecoveryContent(const QString &html,
     if (m_viewMode == DocumentViewMode::Outline)
         m_outlineView->setDocument(m_editor->document());
     endBulkDocumentUpdate();
+    reloadFloatingTextBoxes();
 }
 
 bool DocumentTab::loadFromFile(const QString &fileName, QString *errorMessage)
@@ -163,6 +164,7 @@ bool DocumentTab::loadFromFile(const QString &fileName, QString *errorMessage)
     if (m_viewMode == DocumentViewMode::Outline)
         m_outlineView->setDocument(m_editor->document());
     endBulkDocumentUpdate();
+    reloadFloatingTextBoxes();
     return true;
 }
 
@@ -198,6 +200,7 @@ bool DocumentTab::loadFromPreparedDocx(const DocxConverter::PrepareResult &prepa
     if (m_viewMode == DocumentViewMode::Outline)
         m_outlineView->setDocument(m_editor->document());
     endBulkDocumentUpdate();
+    reloadFloatingTextBoxes();
     return true;
 }
 
