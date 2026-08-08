@@ -23,14 +23,33 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Cache Qt installation
+        id: cache-qt
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/qt
+          key: qt-6.11.0-${{ runner.os }}
+
+      - name: Install ccache
+        run: brew install ccache
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-${{ runner.os }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ runner.os }}-
+
       - name: Install Qt 6.11 via aqtinstall
+        if: steps.cache-qt.outputs.cache-hit != 'true'
         run: |
           pip install --quiet aqtinstall
           aqt install-qt mac desktop 6.11.0 clang_64 -O "$RUNNER_TEMP/qt"
 
       - name: Configure
         # aqt 用 clang_64 架构安装，但 Qt 6.11 的安装目录名仍是 macos
-        run: cmake -B build -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/qt/6.11.0/macos"
+        run: cmake -B build -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/qt/6.11.0/macos" -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
       - name: Build test targets
         # 只构建测试与基准 target，跳过 NewWord.app / render 等重型产物
