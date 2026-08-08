@@ -26,10 +26,10 @@ jobs:
       - name: Install Qt 6.11 via aqtinstall
         run: |
           pip install --quiet aqtinstall
-          aqt install-qt mac desktop 6.11.0 macos -O "$RUNNER_TEMP/qt"
+          aqt install-qt mac desktop 6.11.0 clang_64 -O "$RUNNER_TEMP/qt"
 
       - name: Configure
-        run: cmake -B build -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/qt/6.11.0/macos"
+        run: cmake -B build -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/qt/6.11.0/clang_64"
 
       - name: Build
         run: cmake --build build -j
