@@ -13,6 +13,7 @@
 class QDragEnterEvent;
 class QDropEvent;
 class QMenu;
+class PagedImageObject;
 class QScrollBar;
 class QTextDocument;
 class QTimer;
@@ -52,6 +53,8 @@ public:
     //! keystroke. Rebuilding the same content through the cursor API restores
     //! the fast edit path. Preserves resources (images/formulas) and formats.
     static void normalizeDocumentStructure(QTextDocument *document);
+    //! Cap oversized image resources so memory and paint cost stay bounded.
+    static void downscaleImageResources(QTextDocument *document);
 
     void undo();
     void redo();
@@ -165,6 +168,7 @@ private:
     void afterCursorMove();
     void afterDocumentChange();
     void applyContinuousLayout();
+    void updateEditRegion();
     [[nodiscard]] qreal zoomScale() const;
 
     QTextDocument *m_document = nullptr;
@@ -172,10 +176,12 @@ private:
     HeaderFooterSettings m_headerFooter;
     QTextCursor m_cursor;
     QTextCharFormat m_currentCharFormat;
+    PagedImageObject *m_imageObject = nullptr;
     QScrollBar *m_vScroll = nullptr;
     QTimer *m_blinkTimer = nullptr;
     QTimer *m_autoScrollTimer = nullptr;
     QTimer *m_fullPassTimer = nullptr;
+    QTimer *m_formatCheckTimer = nullptr;
     QPoint m_lastMousePos;
     bool m_cursorVisible = true;
     bool m_hasSelectionDrag = false;
@@ -185,6 +191,8 @@ private:
     bool m_pageMode = true;
     bool m_lastHadSelection = false;
     bool m_maxLineHeightDirty = true;
+    bool m_burstHasChars = false;
+    bool m_burstHasFormatOnly = false;
     int m_preeditLength = 0;
     int m_zoomPercent = 100;
     int m_lastChangePos = -1;

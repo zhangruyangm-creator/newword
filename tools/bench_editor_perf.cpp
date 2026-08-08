@@ -4,7 +4,9 @@
 
 #include <QApplication>
 #include <QAbstractTextDocumentLayout>
+#include <QBuffer>
 #include <QElapsedTimer>
+#include <QImage>
 #include <QTextBlock>
 #include <QTextCursor>
 #include <QTextDocumentFragment>
@@ -224,6 +226,103 @@ void bench(int chars)
                 paginatedRawMs, detachedMs);
 }
 
+QString makeImageDataUrl(int seed, int w, int h)
+{
+    QImage img(w, h, QImage::Format_RGB32);
+    img.fill(QColor(40 + seed * 37 % 180, 80 + seed * 53 % 160, 60 + seed * 29 % 160));
+    QBuffer buffer;
+    buffer.open(QIODevice::WriteOnly);
+    img.save(&buffer, "PNG");
+    return QStringLiteral("data:image/png;base64,%1")
+        .arg(QString::fromLatin1(buffer.data().toBase64()));
+}
+
+void benchFormattedWithImages(int chars, int imageEvery, int imageW, int imageH,
+                              int displayW = 0)
+{
+    // Realistic heavy document: mixed bold/italic/colored runs + inline images.
+    QString html;
+    const QString paragraphTemplate =
+        QStringLiteral("<p>第%1段：普通文本 <b>加粗部分</b> <i>斜体部分</i> "
+                       "<span style=\"color:#c0392b\">彩色文字</span> "
+                       "后续普通文本用于排版负载。%2</p>");
+    int remaining = chars;
+    int para = 0;
+    while (remaining > 0) {
+        QString imgTag;
+        if (para % imageEvery == 0) {
+            const QString src = makeImageDataUrl(para, imageW, imageH);
+            if (displayW > 0) {
+                imgTag = QStringLiteral(" <img width=\"%1\" height=\"%2\" src=\"%3\">")
+                             .arg(displayW)
+                             .arg(displayW * imageH / imageW)
+                             .arg(src);
+            } else {
+                imgTag = QStringLiteral(" <img src=\"%1\">").arg(src);
+            }
+        }
+        html += paragraphTemplate.arg(para + 1).arg(imgTag);
+        remaining -= 90;
+        ++para;
+    }
+
+    QTextDocument doc;
+    PagedEditorWidget view(&doc, PageLayoutSettings{}, HeaderFooterSettings{});
+    QElapsedTimer t;
+    t.start();
+    view.setHtml(html);
+    const qint64 openMs = t.elapsed();
+    const int pages = view.pageCount();
+    const int images = html.count(QStringLiteral("<img "));
+
+    const int kRounds = 30;
+    QTextCursor endCursor(&doc);
+    endCursor.movePosition(QTextCursor::End);
+    view.setTextCursor(endCursor);
+    t.restart();
+    for (int i = 0; i < kRounds; ++i) {
+        QTextCursor c = view.textCursor();
+        c.insertText(QStringLiteral("字"));
+    }
+    const qreal appendKeyMs = qreal(t.elapsed()) / kRounds;
+
+    QTextCursor midCursor(&doc);
+    midCursor.setPosition(doc.characterCount() / 2);
+    view.setTextCursor(midCursor);
+    t.restart();
+    for (int i = 0; i < kRounds; ++i) {
+        QTextCursor c = view.textCursor();
+        c.insertText(QStringLiteral("字"));
+    }
+    const qreal middleKeyMs = qreal(t.elapsed()) / kRounds;
+
+    // --- Same document, every widget handler disconnected ---
+    QObject::disconnect(&doc, nullptr, &view, nullptr);
+    QTextCursor detachedCursor(&doc);
+    detachedCursor.movePosition(QTextCursor::End);
+    t.restart();
+    for (int i = 0; i < kRounds; ++i)
+        detachedCursor.insertText(QStringLiteral("字"));
+    const qreal detachedMs = qreal(t.elapsed()) / kRounds;
+
+    // Paint cost: rendering the visible viewport (pages with images).
+    view.resize(1100, 1200);
+    view.show();
+    QImage frame(view.size(), QImage::Format_ARGB32);
+    for (int i = 0; i < 3; ++i) // warm-up
+        view.render(&frame);
+    t.restart();
+    for (int i = 0; i < 10; ++i)
+        view.render(&frame);
+    const qreal paintMs = qreal(t.elapsed()) / 10;
+
+    std::printf("formatted+images chars=%-8d imgEvery=%-3d imgSize=%dx%-4d open=%-6lldms "
+                "pages=%-4d images=%-4d appendKey=%.2fms middleKey=%.2fms detached=%.2fms "
+                "paint=%.2fms\n",
+                chars, imageEvery, imageW, imageH, openMs, pages, images, appendKeyMs,
+                middleKeyMs, detachedMs, paintMs);
+}
+
 } // namespace
 
 int main(int argc, char **argv)
@@ -234,5 +333,7 @@ int main(int argc, char **argv)
     bench(50'000);
     bench(200'000);
     bench(800'000);
+    benchFormattedWithImages(800'000, 30, 160, 120);  // small images, ~1/page
+    benchFormattedWithImages(800'000, 8, 1200, 900, 480); // large photos at display size
     return 0;
 }

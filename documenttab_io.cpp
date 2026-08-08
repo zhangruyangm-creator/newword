@@ -36,12 +36,22 @@ void DocumentTab::insertImageFile(const QString &fileName)
         return;
 
     QUrl uri = QUrl::fromLocalFile(fileName);
-    m_editor->document()->addResource(QTextDocument::ImageResource, uri, image);
     QTextImageFormat imageFormat;
     imageFormat.setName(uri.toString());
     const PageGeometry geo = PageGeometry::from(m_pageLayout, m_zoomPercent);
     const int maxW = qMax(200, geo.pageWidthPx - 2 * geo.marginPx);
     ImageProps::fitToMaxWidth(&imageFormat, image, qMin(480, maxW));
+    // Store a bounded-resource copy: memory and repaint cost stay proportional
+    // to the display size, not the camera resolution.
+    const int cap = qMin(2048, 2 * qRound(imageFormat.width()));
+    const int longest = qMax(image.width(), image.height());
+    if (longest > cap) {
+        const qreal scale = qreal(cap) / longest;
+        image = image.scaled(qMax(1, int(image.width() * scale)),
+                             qMax(1, int(image.height() * scale)), Qt::KeepAspectRatio,
+                             Qt::SmoothTransformation);
+    }
+    m_editor->document()->addResource(QTextDocument::ImageResource, uri, image);
     ImageProps::setWrap(&imageFormat, ImageProps::Wrap::Block);
     ImageProps::setAlign(&imageFormat, Qt::AlignHCenter);
 
@@ -112,6 +122,7 @@ bool DocumentTab::loadFromFile(const QString &fileName, QString *errorMessage)
             return false;
         }
         PagedEditorWidget::normalizeDocumentStructure(m_editor->document());
+        PagedEditorWidget::downscaleImageResources(m_editor->document());
         m_headerFooter = meta.headerFooter;
         if (meta.pageLayout.pageSizeMm().width() > 10)
             setPageLayout(meta.pageLayout);
@@ -141,6 +152,7 @@ bool DocumentTab::loadFromFile(const QString &fileName, QString *errorMessage)
             m_editor->document()->setMarkdown(processed, QTextDocument::MarkdownDialectGitHub);
             FormulaIO::injectMarkdownFormulas(m_editor->document(), formulas, dpr);
             PagedEditorWidget::normalizeDocumentStructure(m_editor->document());
+            PagedEditorWidget::downscaleImageResources(m_editor->document());
         } else {
             m_editor->setPlainText(text);
         }
@@ -165,6 +177,7 @@ bool DocumentTab::loadFromPreparedDocx(const DocxConverter::PrepareResult &prepa
         const qreal dpr = qMax<qreal>(1.0, m_editor->devicePixelRatioF());
         m_editor->setHtml(prepared.html);
         PagedEditorWidget::normalizeDocumentStructure(m_editor->document());
+        PagedEditorWidget::downscaleImageResources(m_editor->document());
         FormulaIO::restoreFormulasFromHtml(m_editor->document(), dpr);
         m_editor->document()->setModified(false);
     } else if (!DocxConverter::applyPrepared(m_editor->document(), prepared, fileName,
@@ -173,6 +186,7 @@ bool DocumentTab::loadFromPreparedDocx(const DocxConverter::PrepareResult &prepa
         return false;
     }
     PagedEditorWidget::normalizeDocumentStructure(m_editor->document());
+    PagedEditorWidget::downscaleImageResources(m_editor->document());
 
     m_headerFooter = meta.headerFooter;
     if (meta.pageLayout.pageSizeMm().width() > 10)

@@ -13,16 +13,21 @@
 #include <QFocusEvent>
 #include <QFileInfo>
 #include <QInputMethodEvent>
+#include <QImage>
 #include <QKeyEvent>
 #include <QMenu>
 #include <QMimeData>
 #include <QMouseEvent>
+#include <QCache>
 #include <QPainter>
+#include <QPixmap>
 #include <QPalette>
 #include <QScrollBar>
 #include <QTextBlock>
 #include <QTextDocument>
 #include <QTextDocumentFragment>
+#include <QTextImageFormat>
+#include <QTextObjectInterface>
 #include <QTextLayout>
 #include <QTextLine>
 #include <QTimer>
@@ -71,6 +76,78 @@ bool dragCarriesImage(const QDropEvent *event)
 }
 } // namespace
 
+//! Image object handler with a scaled-pixmap cache: each image is scaled once
+//! per target size, then blitted — large-photo documents repaint cheaply.
+class PagedImageObject : public QObject, public QTextObjectInterface
+{
+    Q_OBJECT
+    Q_INTERFACES(QTextObjectInterface)
+
+public:
+    explicit PagedImageObject(QObject *parent = nullptr)
+        : QObject(parent)
+        , m_cache(2048) // ~128 MB of scaled pixmaps
+    {
+    }
+
+    QSizeF intrinsicSize(QTextDocument *document, int, const QTextFormat &format) override
+    {
+        const QTextImageFormat imageFormat = format.toImageFormat();
+        const QSizeF fmtSize(imageFormat.width(), imageFormat.height());
+        const QImage image = qvariant_cast<QImage>(
+            document->resource(QTextDocument::ImageResource, imageFormat.name()));
+        if (fmtSize.width() > 0 && fmtSize.height() > 0)
+            return fmtSize;
+        if (image.isNull())
+            return fmtSize;
+        QSizeF size = image.size();
+        if (fmtSize.width() > 0) {
+            size.setHeight(size.height() * fmtSize.width() / size.width());
+            size.setWidth(fmtSize.width());
+        } else if (fmtSize.height() > 0) {
+            size.setWidth(size.width() * fmtSize.height() / size.height());
+            size.setHeight(fmtSize.height());
+        }
+        return size;
+    }
+
+    void drawObject(QPainter *painter, const QRectF &rect, QTextDocument *document, int,
+                    const QTextFormat &format) override
+    {
+        const QTextImageFormat imageFormat = format.toImageFormat();
+        const QString name = imageFormat.name();
+        if (name.isEmpty())
+            return;
+        const QImage image = qvariant_cast<QImage>(
+            document->resource(QTextDocument::ImageResource, name));
+        if (image.isNull())
+            return;
+        const QSize target = rect.size().toSize();
+        if (target.width() <= 0 || target.height() <= 0)
+            return;
+        const QString key = QStringLiteral("%1@%2x%3").arg(name).arg(target.width())
+                                .arg(target.height());
+        QPixmap *cached = m_cache.object(key);
+        if (!cached) {
+            QPixmap pm = QPixmap::fromImage(image).scaled(
+                target, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+            if (pm.isNull())
+                return;
+            m_cache.insert(key, new QPixmap(pm),
+                           qMax(1, (pm.width() * pm.height() * 4) / 65536));
+            cached = m_cache.object(key);
+        }
+        if (!cached)
+            return;
+        const QPointF offset((rect.width() - cached->width()) / 2.0,
+                             (rect.height() - cached->height()) / 2.0);
+        painter->drawPixmap(rect.topLeft() + offset, *cached);
+    }
+
+private:
+    QCache<QString, QPixmap> m_cache;
+};
+
 PagedEditorWidget::PagedEditorWidget(QTextDocument *document,
                                      const PageLayoutSettings &layout,
                                      const HeaderFooterSettings &headerFooter,
@@ -114,11 +191,25 @@ PagedEditorWidget::PagedEditorWidget(QTextDocument *document,
     });
 
     if (m_document) {
+        m_imageObject = new PagedImageObject(this);
+        m_document->documentLayout()->registerHandler(QTextFormat::ImageObject, m_imageObject);
         connect(m_document, &QTextDocument::contentsChange, this,
                 [this](int position, int charsRemoved, int charsAdded) {
-                    m_lastChangePos = position;
-                    if (charsRemoved == 0 && charsAdded == 0)
-                        m_maxLineHeightDirty = true; // formatting change -> full pass
+                    // Qt can emit (0,0) events inside ordinary text edits, so a
+                    // formatting-only burst is recognized only when NO chars
+                    // changed in the whole edit.
+                    if (charsRemoved != 0 || charsAdded != 0) {
+                        if (m_formatCheckTimer)
+                            m_formatCheckTimer->stop();
+                        m_lastChangePos = position;
+                        m_burstHasChars = true;
+                    } else {
+                        if (m_lastChangePos < 0)
+                            m_lastChangePos = position;
+                        m_burstHasFormatOnly = true;
+                        if (m_formatCheckTimer)
+                            m_formatCheckTimer->start();
+                    }
                 });
         connect(m_document, &QTextDocument::undoAvailable, this,
                 &PagedEditorWidget::undoAvailable);
@@ -155,6 +246,27 @@ PagedEditorWidget::PagedEditorWidget(QTextDocument *document,
         updateScrollBar();
         update();
         emit pageInfoChanged();
+    });
+
+    // A genuine formatting change (font size / spacing) must trigger a full
+    // pagination pass, but Qt also reports (0,0) events inside ordinary text
+    // edits. Wait a short window: if real characters follow, treat it as an edit.
+    m_formatCheckTimer = new QTimer(this);
+    m_formatCheckTimer->setSingleShot(true);
+    m_formatCheckTimer->setInterval(40);
+    connect(m_formatCheckTimer, &QTimer::timeout, this, [this]() {
+        if (m_burstHasChars)
+            return; // a text edit followed the format event — not a format change
+        if (m_burstHasFormatOnly) {
+            m_maxLineHeightDirty = true;
+            recomputePagination();
+            updateScrollBar();
+            update();
+            emit pageInfoChanged();
+        }
+        m_burstHasChars = false;
+        m_burstHasFormatOnly = false;
+        m_lastChangePos = -1;
     });
 
     updateMetrics();
@@ -287,6 +399,7 @@ void PagedEditorWidget::setHtml(const QString &html)
         return;
     m_document->setHtml(html);
     normalizeDocumentStructure(m_document);
+    downscaleImageResources(m_document);
     m_currentCharFormat = QTextCharFormat();
     m_cursor = QTextCursor(m_document);
     recomputePagination(); // bulk replace: exact pagination right away
@@ -358,6 +471,36 @@ void PagedEditorWidget::normalizeDocumentStructure(QTextDocument *document)
         }
     }
     document->setUndoRedoEnabled(undoEnabled);
+}
+
+void PagedEditorWidget::downscaleImageResources(QTextDocument *document)
+{
+    if (!document)
+        return;
+    constexpr int kMaxImageDim = 2048; // enough for print at display sizes
+    for (QTextBlock b = document->begin(); b.isValid(); b = b.next()) {
+        for (auto it = b.begin(); !it.atEnd(); ++it) {
+            const QTextFragment fragment = it.fragment();
+            if (!fragment.charFormat().isImageFormat())
+                continue;
+            const QString name = fragment.charFormat().toImageFormat().name();
+            if (name.isEmpty())
+                continue;
+            const QVariant resource =
+                document->resource(QTextDocument::ImageResource, name);
+            if (!resource.canConvert<QImage>())
+                continue;
+            const QImage image = resource.value<QImage>();
+            const int longest = qMax(image.width(), image.height());
+            if (longest <= kMaxImageDim)
+                continue;
+            const QImage scaled = image.scaled(
+                image.width() * kMaxImageDim / longest,
+                image.height() * kMaxImageDim / longest, Qt::KeepAspectRatio,
+                Qt::SmoothTransformation);
+            document->addResource(QTextDocument::ImageResource, name, scaled);
+        }
+    }
 }
 
 void PagedEditorWidget::setPlainText(const QString &text)
@@ -1129,10 +1272,20 @@ void PagedEditorWidget::ensureRangesThroughPage(int pageIndex) const
             const int lp = qMax(0, int(std::floor(top / m_layoutPageHeight)));
             const qreal bottom = top + ln.height();
             if (lp < page) {
-                // Content moved onto an earlier page (large delete) — safe path.
-                m_recomputingPagination = false;
-                const_cast<PagedEditorWidget *>(this)->recomputePagination();
-                return;
+                if (lp != page - 1) {
+                    // Content moved onto a much earlier page (large delete) —
+                    // safe path: full pass.
+                    m_recomputingPagination = false;
+                    const_cast<PagedEditorWidget *>(this)->recomputePagination();
+                    return;
+                }
+                // Boundary off-by-one: the first walked line sits on the page
+                // before the expected start (a block straddles the break).
+                // Back up one page and rebuild its end from the walk.
+                page = lp;
+                maxBottom = std::numeric_limits<qreal>::lowest();
+                if (page < m_pageRanges.size())
+                    m_pageRanges[page].end = m_pageRanges[page].start;
             }
             if (lp > page) {
                 if (!finishCurrentPage())
@@ -1520,18 +1673,42 @@ void PagedEditorWidget::afterDocumentChange()
         update();
         return;
     }
-    if (m_maxLineHeightDirty) {
-        recomputePagination(); // formatting change: line heights may differ
-        updateScrollBar();
+    if (!m_burstHasChars) {
+        // Formatting-only cycle: no text geometry changed. The 40ms format
+        // check decides whether a real format change needs a full pass.
+        if (m_burstHasFormatOnly && m_formatCheckTimer)
+            m_formatCheckTimer->start();
         update();
         return;
     }
+    m_burstHasChars = false;
+    m_burstHasFormatOnly = false;
     markDirty(m_lastChangePos);
+    m_lastChangePos = -1;
     if (m_fullPassTimer)
         m_fullPassTimer->start(); // debounced full pass for exact page count/scrollbar
     (void)currentPageIndex();     // rebuilds ranges through the caret page immediately
     updateScrollBar();
-    update();
+    updateEditRegion();
+}
+
+void PagedEditorWidget::updateEditRegion()
+{
+    if (!m_document || m_pageCount <= 0) {
+        update();
+        return;
+    }
+    const int page = currentPageIndex();
+    const QRectF content = contentRectInWidget(page);
+    const QRectF caret = cursorRect();
+    const qreal y0 = qMax(content.top(), caret.top() - 24);
+    QRect region(qRound(content.left()), qRound(y0), qRound(content.width()),
+                 qRound(content.bottom() - y0 + 8));
+    if (page + 1 < m_pageCount) {
+        const QRectF next = contentRectInWidget(page + 1);
+        region |= QRect(qRound(next.left()), qRound(next.top()), qRound(next.width()), 48);
+    }
+    update(region);
 }
 
 void PagedEditorWidget::setPageLayout(const PageLayoutSettings &layout)
@@ -1544,6 +1721,8 @@ void PagedEditorWidget::setPageLayout(const PageLayoutSettings &layout)
     emit pageInfoChanged();
     emit pageGeometryChanged();
 }
+
+#include "pagededitorwidget.moc"
 
 void PagedEditorWidget::setHeaderFooter(const HeaderFooterSettings &settings)
 {
