@@ -1,0 +1,11 @@
+CompileFlags:
+  CompilationDatabase: build
+  Add:
+    - -I/Users/zhangruyang/Qt/6.11.0/macos/lib/QtWidgets.framework/Headers
+    - -I/Users/zhangruyang/Qt/6.11.0/macos/lib/QtGui.framework/Headers
+    - -I/Users/zhangruyang/Qt/6.11.0/macos/lib/QtCore.framework/Headers
+    - -I/Users/zhangruyang/Qt/6.11.0/macos/lib/QtPrintSupport.framework/Headers
+    - -F/Users/zhangruyang/Qt/6.11.0/macos/lib
+    - -I/Users/zhangruyang/Qt/6.11.0/macos/include
+    - -iframework
+    - /Users/zhangruyang/Qt/6.11.0/macos/lib

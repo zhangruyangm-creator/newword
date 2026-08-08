@@ -1,0 +1,2 @@
+mammoth>=1.6
+html2docx>=1.6

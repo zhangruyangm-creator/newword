@@ -1,0 +1,8 @@
+build/
+.venv/
+*.user
+*.autosave
+.DS_Store
+CMakeLists.txt.user
+__cmake_systeminformation/
+compile_commands.json

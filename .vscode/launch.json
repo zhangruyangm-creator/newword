@@ -1,0 +1,17 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug NewWord",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/NewWord.app/Contents/MacOS/NewWord",
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "MIMode": "lldb",
+      "preLaunchTask": "build-newword-debug",
+      "stopAtEntry": false,
+      "externalConsole": false
+    }
+  ]
+}
