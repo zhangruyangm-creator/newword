@@ -1,6 +1,7 @@
 #include "pagededitorwidget.h"
 
 #include "appstyle.h"
+#include "pagedimageobject.h"
 #include "pagegeometry.h"
 #include "tablegeometry.h"
 
@@ -19,9 +20,7 @@
 #include <QMenu>
 #include <QMimeData>
 #include <QMouseEvent>
-#include <QCache>
 #include <QPainter>
-#include <QPixmap>
 #include <QPalette>
 #include <QScrollBar>
 #include <QTextBlock>
@@ -80,84 +79,14 @@ bool dragCarriesImage(const QDropEvent *event)
 }
 } // namespace
 
-//! Image object handler with a scaled-pixmap cache: each image is scaled once
-//! per target size, then blitted — large-photo documents repaint cheaply.
-class PagedImageObject : public QObject, public QTextObjectInterface
-{
-    Q_OBJECT
-    Q_INTERFACES(QTextObjectInterface)
-
-public:
-    explicit PagedImageObject(QObject *parent = nullptr)
-        : QObject(parent)
-        , m_cache(2048) // ~128 MB of scaled pixmaps
-    {
-    }
-
-    QSizeF intrinsicSize(QTextDocument *document, int, const QTextFormat &format) override
-    {
-        const QTextImageFormat imageFormat = format.toImageFormat();
-        const QSizeF fmtSize(imageFormat.width(), imageFormat.height());
-        const QImage image = qvariant_cast<QImage>(
-            document->resource(QTextDocument::ImageResource, imageFormat.name()));
-        if (fmtSize.width() > 0 && fmtSize.height() > 0)
-            return fmtSize;
-        if (image.isNull())
-            return fmtSize;
-        QSizeF size = image.size();
-        if (fmtSize.width() > 0) {
-            size.setHeight(size.height() * fmtSize.width() / size.width());
-            size.setWidth(fmtSize.width());
-        } else if (fmtSize.height() > 0) {
-            size.setWidth(size.width() * fmtSize.height() / size.height());
-            size.setHeight(fmtSize.height());
-        }
-        return size;
-    }
-
-    void drawObject(QPainter *painter, const QRectF &rect, QTextDocument *document, int,
-                    const QTextFormat &format) override
-    {
-        const QTextImageFormat imageFormat = format.toImageFormat();
-        const QString name = imageFormat.name();
-        if (name.isEmpty())
-            return;
-        const QImage image = qvariant_cast<QImage>(
-            document->resource(QTextDocument::ImageResource, name));
-        if (image.isNull())
-            return;
-        const QSize target = rect.size().toSize();
-        if (target.width() <= 0 || target.height() <= 0)
-            return;
-        const QString key = QStringLiteral("%1@%2x%3").arg(name).arg(target.width())
-                                .arg(target.height());
-        QPixmap *cached = m_cache.object(key);
-        if (!cached) {
-            QPixmap pm = QPixmap::fromImage(image).scaled(
-                target, Qt::KeepAspectRatio, Qt::SmoothTransformation);
-            if (pm.isNull())
-                return;
-            m_cache.insert(key, new QPixmap(pm),
-                           qMax(1, (pm.width() * pm.height() * 4) / 65536));
-            cached = m_cache.object(key);
-        }
-        if (!cached)
-            return;
-        const QPointF offset((rect.width() - cached->width()) / 2.0,
-                             (rect.height() - cached->height()) / 2.0);
-        painter->drawPixmap(rect.topLeft() + offset, *cached);
-    }
-
-private:
-    QCache<QString, QPixmap> m_cache;
-};
-
 PagedEditorWidget::PagedEditorWidget(QTextDocument *document,
                                      const PageLayoutSettings &layout,
                                      const HeaderFooterSettings &headerFooter,
                                      QWidget *parent)
     : QWidget(parent)
     , m_document(document)
+    , m_layoutModel(document)
+    , m_floatBoxes(this)
     , m_layout(layout)
     , m_headerFooter(headerFooter)
     , m_cursor(m_document)
@@ -197,6 +126,10 @@ PagedEditorWidget::PagedEditorWidget(QTextDocument *document,
     if (m_document) {
         m_imageObject = new PagedImageObject(this);
         m_document->documentLayout()->registerHandler(QTextFormat::ImageObject, m_imageObject);
+        m_floatBoxes.setDocument(m_document);
+        m_floatBoxes.setPageContentRect([this](int page) { return contentRectInWidget(page); });
+        connect(&m_floatBoxes, &PagedFloatingBoxes::boxesChanged, this,
+                &PagedEditorWidget::floatingBoxesChanged);
         connect(m_document, &QTextDocument::contentsChange, this,
                 [this](int position, int charsRemoved, int charsAdded) {
                     // Qt can emit (0,0) events inside ordinary text edits, so a
@@ -223,7 +156,7 @@ PagedEditorWidget::PagedEditorWidget(QTextDocument *document,
                 [this]() { afterDocumentChange(); });
         connect(m_document->documentLayout(), &QAbstractTextDocumentLayout::documentSizeChanged,
                 this, [this]() {
-                    if (m_recomputingPagination)
+                    if (m_layoutModel.recomputing())
                         return;
                     updatePageCount();
                     updateScrollBar();
@@ -231,7 +164,7 @@ PagedEditorWidget::PagedEditorWidget(QTextDocument *document,
                 });
         connect(m_document->documentLayout(), &QAbstractTextDocumentLayout::pageCountChanged,
                 this, [this](int) {
-                    if (m_recomputingPagination)
+                    if (m_layoutModel.recomputing())
                         return;
                     updatePageCount();
                     updateScrollBar();
@@ -245,8 +178,10 @@ PagedEditorWidget::PagedEditorWidget(QTextDocument *document,
     connect(m_fullPassTimer, &QTimer::timeout, this, [this]() {
         if (!m_pageMode)
             return;
-        if (m_maxLineHeightDirty || m_rebuildBlock >= 0)
-            recomputePagination();
+        if (m_layoutModel.isDirty()) {
+            m_layoutModel.recompute();
+            updatePageCount();
+        }
         updateScrollBar();
         update();
         emit pageInfoChanged();
@@ -262,8 +197,9 @@ PagedEditorWidget::PagedEditorWidget(QTextDocument *document,
         if (m_burstHasChars)
             return; // a text edit followed the format event — not a format change
         if (m_burstHasFormatOnly) {
-            m_maxLineHeightDirty = true;
-            recomputePagination();
+            m_layoutModel.setMaxLineHeightDirty(true);
+            m_layoutModel.recompute();
+            updatePageCount();
             updateScrollBar();
             update();
             emit pageInfoChanged();
@@ -316,9 +252,9 @@ int PagedEditorWidget::currentPageIndex() const
         return 0;
     // A block may span pages; the caret's page is determined by its LINE.
     const qreal docTop = blockRect.top() + (line.isValid() ? line.y() : 0.0);
-    int page = pageIndexForDocY(qMax(0.0, docTop));
-    ensureRangesThroughPage(page);
-    return pageIndexForDocY(qMax(0.0, docTop));
+    int page = m_layoutModel.pageIndexForDocY(qMax(0.0, docTop));
+    m_layoutModel.ensureRangesThroughPage(page);
+    return m_layoutModel.pageIndexForDocY(qMax(0.0, docTop));
 }
 
 void PagedEditorWidget::undo()
@@ -406,7 +342,8 @@ void PagedEditorWidget::setHtml(const QString &html)
     downscaleImageResources(m_document);
     m_currentCharFormat = QTextCharFormat();
     m_cursor = QTextCursor(m_document);
-    recomputePagination(); // bulk replace: exact pagination right away
+    m_layoutModel.recompute();
+    updatePageCount(); // bulk replace: exact pagination right away
     updateScrollBar();
     update();
     afterCursorMove();
@@ -509,120 +446,20 @@ void PagedEditorWidget::downscaleImageResources(QTextDocument *document)
 
 void PagedEditorWidget::reloadFloatingTextBoxes()
 {
-    m_floatBoxes = FloatingTextBoxes::load(m_document);
-    m_floatBoxDocs.clear();
-    if (!m_selectedBoxId.isEmpty() && indexOfFloatingBox(m_selectedBoxId) < 0)
-        m_selectedBoxId.clear();
-    closeBoxEditor();
+    m_floatBoxes.reload();
     update();
 }
 
 void PagedEditorWidget::insertFloatingTextBox(const FloatingTextBox &box)
 {
-    m_floatBoxes.append(box);
-    saveFloatingBoxes();
-    m_selectedBoxId = box.id;
+    m_floatBoxes.insert(box);
     update();
 }
 
 void PagedEditorWidget::removeFloatingTextBox(const QString &id)
 {
-    const int idx = indexOfFloatingBox(id);
-    if (idx < 0)
-        return;
-    closeBoxEditor();
-    m_floatBoxes.removeAt(idx);
-    m_floatBoxDocs.remove(id);
-    if (m_selectedBoxId == id)
-        m_selectedBoxId.clear();
-    saveFloatingBoxes();
-}
-
-void PagedEditorWidget::saveFloatingBoxes()
-{
-    if (!m_document)
-        return;
-    FloatingTextBoxes::save(m_document, m_floatBoxes, true);
+    m_floatBoxes.remove(id);
     update();
-    emit floatingBoxesChanged();
-}
-
-int PagedEditorWidget::indexOfFloatingBox(const QString &id) const
-{
-    for (int i = 0; i < m_floatBoxes.size(); ++i) {
-        if (m_floatBoxes.at(i).id == id)
-            return i;
-    }
-    return -1;
-}
-
-QRectF PagedEditorWidget::floatBoxRectInWidget(const FloatingTextBox &box) const
-{
-    const qreal f = zoomScale();
-    constexpr qreal kPtToPx = 96.0 / 72.0;
-    const int page = qBound(0, box.pageIndex, qMax(0, m_pageCount - 1));
-    const QRectF content = contentRectInWidget(page);
-    return QRectF(content.left() + box.xPt * kPtToPx * f,
-                  content.top() + box.yPt * kPtToPx * f,
-                  box.wPt * kPtToPx * f,
-                  box.hPt * kPtToPx * f);
-}
-
-int PagedEditorWidget::hitTestFloatingBox(const QPoint &widgetPos) const
-{
-    for (int i = m_floatBoxes.size() - 1; i >= 0; --i) {
-        if (floatBoxRectInWidget(m_floatBoxes.at(i)).adjusted(-2, -2, 2, 2)
-                .contains(widgetPos)) {
-            return i;
-        }
-    }
-    return -1;
-}
-
-void PagedEditorWidget::paintFloatingBoxes(QPainter *painter, int pageIndex)
-{
-    for (int i = 0; i < m_floatBoxes.size(); ++i) {
-        const FloatingTextBox &box = m_floatBoxes.at(i);
-        if (box.pageIndex != pageIndex)
-            continue;
-        const QRectF r = floatBoxRectInWidget(box);
-        painter->fillRect(r, QColor(255, 255, 255, 238));
-
-        const bool selected = box.id == m_selectedBoxId;
-        QPen pen(selected ? QColor(110, 118, 132) : QColor(198, 202, 210), 1.0);
-        pen.setCosmetic(true);
-        if (!selected) {
-            pen.setStyle(Qt::DashLine);
-            pen.setDashPattern({3.0, 2.5});
-        }
-        painter->setPen(pen);
-        painter->setBrush(Qt::NoBrush);
-        painter->drawRect(r.adjusted(0.5, 0.5, -0.5, -0.5));
-
-        const QRectF content = r.adjusted(3, 3, -3, -3);
-        if (content.width() > 10 && content.height() > 10) {
-            QTextDocument *boxDoc = m_floatBoxDocs.value(box.id);
-            if (!boxDoc) {
-                boxDoc = new QTextDocument(this);
-                boxDoc->setDocumentMargin(0);
-                boxDoc->setHtml(box.html);
-                m_floatBoxDocs.insert(box.id, boxDoc);
-            }
-            boxDoc->setPageSize(content.size());
-            painter->save();
-            painter->setClipRect(content);
-            painter->translate(content.topLeft());
-            QAbstractTextDocumentLayout::PaintContext ctx;
-            ctx.palette = palette();
-            boxDoc->documentLayout()->draw(painter, ctx);
-            painter->restore();
-        }
-
-        if (selected) {
-            painter->fillRect(QRectF(r.right() - 7, r.bottom() - 7, 7, 7),
-                              QColor(150, 156, 168));
-        }
-    }
 }
 
 void PagedEditorWidget::setGridLinesVisible(bool visible)
@@ -704,12 +541,30 @@ void PagedEditorWidget::updateColumnResizeCursor(const QPoint &widgetPos)
 {
     if (m_columnResize.active)
         return;
+
+    // Floating text box hover takes priority: size-diagonal over the resize
+    // grip, move anywhere else on the box, IBeam while the box editor is open.
+    if (m_floatBoxes.editorVisible()) {
+        if (m_hoveringColumnBorder)
+            m_hoveringColumnBorder = false;
+        unsetCursor();
+        return;
+    }
+    Qt::CursorShape boxShape;
+    if (m_floatBoxes.hoverShape(widgetPos, zoomScale(), &boxShape) && !m_readOnly) {
+        if (m_hoveringColumnBorder)
+            m_hoveringColumnBorder = false;
+        setCursor(boxShape);
+        return;
+    }
+
     QTextTable *table = nullptr;
     const int border = hitTestColumnBorder(widgetPos, &table);
     const bool hover = border >= 0 && table;
     if (hover)
         setCursor(Qt::SplitHCursor);
-    else if (m_hoveringColumnBorder)
+    else if (m_hoveringColumnBorder || cursor().shape() == Qt::SizeAllCursor
+             || cursor().shape() == Qt::SizeFDiagCursor)
         unsetCursor();
     m_hoveringColumnBorder = hover;
 }
@@ -752,79 +607,6 @@ void PagedEditorWidget::applyColumnResizeDrag(const QPoint &widgetPos)
     update();
 }
 
-void PagedEditorWidget::openBoxEditor(const QString &id)
-{
-    if (m_readOnly)
-        return;
-    const int idx = indexOfFloatingBox(id);
-    if (idx < 0)
-        return;
-    if (!m_boxEditor) {
-        m_boxEditor = new QTextEdit(this);
-        m_boxEditor->setFrameShape(QFrame::NoFrame);
-        m_boxEditor->setStyleSheet(QStringLiteral(
-            "QTextEdit { background: white; border: 1px solid #8a93a3; }"));
-        m_boxEditor->installEventFilter(this);
-        m_boxEditor->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
-        m_boxEditor->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
-        m_boxEditor->hide();
-    }
-    m_editingBoxId = id;
-    const FloatingTextBox &box = m_floatBoxes.at(idx);
-    m_boxEditor->setGeometry(floatBoxRectInWidget(box).toRect().adjusted(1, 1, -1, -1));
-    m_boxEditor->setHtml(box.html);
-    m_boxEditor->show();
-    m_boxEditor->raise();
-    m_boxEditor->setFocus();
-}
-
-void PagedEditorWidget::commitBoxEditor()
-{
-    if (!m_boxEditor || m_editingBoxId.isEmpty())
-        return;
-    const int idx = indexOfFloatingBox(m_editingBoxId);
-    if (idx >= 0) {
-        m_floatBoxes[idx].html = m_boxEditor->toHtml();
-        m_floatBoxDocs.remove(m_editingBoxId);
-        saveFloatingBoxes();
-    }
-    m_editingBoxId.clear();
-    m_boxEditor->hide();
-}
-
-void PagedEditorWidget::closeBoxEditor()
-{
-    if (!m_boxEditor)
-        return;
-    m_editingBoxId.clear();
-    m_boxEditor->hide();
-}
-
-bool PagedEditorWidget::eventFilter(QObject *watched, QEvent *event)
-{
-    if (watched == m_boxEditor) {
-        if (event->type() == QEvent::FocusOut) {
-            commitBoxEditor();
-            return false;
-        }
-        if (event->type() == QEvent::KeyPress) {
-            auto *keyEvent = static_cast<QKeyEvent *>(event);
-            if (keyEvent->key() == Qt::Key_Escape) {
-                closeBoxEditor();
-                setFocus();
-                return true;
-            }
-            if (keyEvent->key() == Qt::Key_Return
-                && (keyEvent->modifiers() & Qt::ControlModifier)) {
-                commitBoxEditor();
-                setFocus();
-                return true;
-            }
-        }
-    }
-    return QWidget::eventFilter(watched, event);
-}
-
 void PagedEditorWidget::setPlainText(const QString &text)
 {
     if (!m_document)
@@ -832,7 +614,8 @@ void PagedEditorWidget::setPlainText(const QString &text)
     m_document->setPlainText(text);
     m_currentCharFormat = QTextCharFormat();
     m_cursor = QTextCursor(m_document);
-    recomputePagination();
+    m_layoutModel.recompute();
+    updatePageCount();
     updateScrollBar();
     update();
     afterCursorMove();
@@ -1015,13 +798,13 @@ QRectF PagedEditorWidget::cursorRect() const
     } else {
         docRect = QRectF(blockRect.left(), blockRect.top(), 2, blockRect.height());
     }
-    int page = pageIndexForDocY(qMax(0.0, docRect.top()));
-    ensureRangesThroughPage(page);
-    page = pageIndexForDocY(qMax(0.0, docRect.top()));
+    int page = m_layoutModel.pageIndexForDocY(qMax(0.0, docRect.top()));
+    m_layoutModel.ensureRangesThroughPage(page);
+    page = m_layoutModel.pageIndexForDocY(qMax(0.0, docRect.top()));
     const QRectF content = contentRectInWidget(page);
     const qreal f = zoomScale();
     return QRectF(content.left() + docRect.left() * f,
-                  content.top() + (docRect.top() - m_pageRanges.at(page).start) * f,
+                  content.top() + (docRect.top() - m_layoutModel.ranges().at(page).start) * f,
                   qMax(1.0, docRect.width() * f), docRect.height() * f);
 }
 
@@ -1077,15 +860,9 @@ void PagedEditorWidget::wheelEvent(QWheelEvent *event)
 void PagedEditorWidget::mousePressEvent(QMouseEvent *event)
 {
     if (event->button() == Qt::LeftButton) {
-        const int boxIdx = hitTestFloatingBox(event->pos());
+        const int boxIdx = m_floatBoxes.hitTest(event->pos(), zoomScale());
         if (boxIdx >= 0 && !m_readOnly) {
-            m_selectedBoxId = m_floatBoxes.at(boxIdx).id;
-            m_boxDragOrig = m_floatBoxes.at(boxIdx);
-            m_boxDragStart = event->pos();
-            const QRectF r = floatBoxRectInWidget(m_boxDragOrig);
-            m_boxDragResize =
-                QRectF(r.right() - 14, r.bottom() - 14, 14, 14).contains(event->pos());
-            m_boxDragMove = !m_boxDragResize;
+            m_floatBoxes.beginDrag(boxIdx, event->pos(), zoomScale());
             m_dragging = false;
             update();
             event->accept();
@@ -1107,7 +884,7 @@ void PagedEditorWidget::mousePressEvent(QMouseEvent *event)
             event->accept();
             return;
         }
-        m_selectedBoxId.clear();
+        m_floatBoxes.clearSelection();
         update();
         m_hasSelectionDrag = true;
         m_dragging = true;
@@ -1127,23 +904,9 @@ void PagedEditorWidget::mouseMoveEvent(QMouseEvent *event)
         event->accept();
         return;
     }
-    if (m_boxDragMove || m_boxDragResize) {
-        const int idx = indexOfFloatingBox(m_selectedBoxId);
-        if (idx >= 0) {
-            const qreal f = zoomScale();
-            constexpr qreal kPtToPx = 96.0 / 72.0;
-            const qreal inv = 1.0 / (kPtToPx * f);
-            const QPointF delta = (event->pos() - m_boxDragStart) * inv;
-            FloatingTextBox &box = m_floatBoxes[idx];
-            if (m_boxDragMove) {
-                box.xPt = qMax(0.0, m_boxDragOrig.xPt + delta.x());
-                box.yPt = qMax(0.0, m_boxDragOrig.yPt + delta.y());
-            } else {
-                box.wPt = qMax(30.0, m_boxDragOrig.wPt + delta.x());
-                box.hPt = qMax(20.0, m_boxDragOrig.hPt + delta.y());
-            }
-            update();
-        }
+    if (m_floatBoxes.isDragging()) {
+        m_floatBoxes.dragTo(event->pos(), zoomScale());
+        update();
         event->accept();
         return;
     }
@@ -1173,10 +936,8 @@ void PagedEditorWidget::mouseReleaseEvent(QMouseEvent *event)
             event->accept();
             return;
         }
-        if (m_boxDragMove || m_boxDragResize) {
-            m_boxDragMove = false;
-            m_boxDragResize = false;
-            saveFloatingBoxes();
+        if (m_floatBoxes.endDrag(event->pos(), zoomScale())) {
+            update();
             event->accept();
             return;
         }
@@ -1194,6 +955,9 @@ void PagedEditorWidget::leaveEvent(QEvent *event)
         unsetCursor();
         m_hoveringColumnBorder = false;
     }
+    if (!m_floatBoxes.isDragging()
+        && (cursor().shape() == Qt::SizeAllCursor || cursor().shape() == Qt::SizeFDiagCursor))
+        unsetCursor();
     QWidget::leaveEvent(event);
 }
 
@@ -1203,10 +967,9 @@ void PagedEditorWidget::mouseDoubleClickEvent(QMouseEvent *event)
         event->ignore();
         return;
     }
-    const int boxIdx = hitTestFloatingBox(event->pos());
+    const int boxIdx = m_floatBoxes.hitTest(event->pos(), zoomScale());
     if (boxIdx >= 0) {
-        m_selectedBoxId = m_floatBoxes.at(boxIdx).id;
-        openBoxEditor(m_selectedBoxId);
+        m_floatBoxes.openEditorAt(boxIdx, zoomScale());
         update();
         event->accept();
         return;
@@ -1249,10 +1012,9 @@ void PagedEditorWidget::keyPressEvent(QKeyEvent *event)
     const Qt::KeyboardModifiers mods = event->modifiers();
     const QString text = event->text();
 
-    if (key == Qt::Key_Delete && !m_selectedBoxId.isEmpty()
-        && (!m_boxEditor || !m_boxEditor->isVisible())) {
-        removeFloatingTextBox(m_selectedBoxId);
-        m_selectedBoxId.clear();
+    if (key == Qt::Key_Delete && !m_floatBoxes.selectedId().isEmpty()
+        && !m_floatBoxes.editorVisible()) {
+        m_floatBoxes.remove(m_floatBoxes.selectedId());
         event->accept();
         return;
     }
@@ -1473,18 +1235,18 @@ void PagedEditorWidget::focusOutEvent(QFocusEvent *event)
 
 void PagedEditorWidget::contextMenuEvent(QContextMenuEvent *event)
 {
-    const int boxIdx = hitTestFloatingBox(event->pos());
+    const int boxIdx = m_floatBoxes.hitTest(event->pos(), zoomScale());
     if (boxIdx >= 0) {
-        m_selectedBoxId = m_floatBoxes.at(boxIdx).id;
+        m_floatBoxes.selectAt(boxIdx);
         update();
         QMenu menu(this);
         QAction *edit = menu.addAction(tr("编辑文字"));
         QAction *del = menu.addAction(tr("删除文本框"));
         QAction *chosen = menu.exec(event->globalPos());
         if (chosen == edit)
-            openBoxEditor(m_selectedBoxId);
+            m_floatBoxes.openEditor(m_floatBoxes.selectedId(), zoomScale());
         else if (chosen == del)
-            removeFloatingTextBox(m_selectedBoxId);
+            m_floatBoxes.remove(m_floatBoxes.selectedId());
         event->accept();
         return;
     }
@@ -1558,6 +1320,7 @@ void PagedEditorWidget::updateMetrics()
                                - (m_layout.headerDistanceMm + m_layout.footerDistanceMm) * kMmToPx);
     m_gap = 28;
     m_topPad = 24;
+    m_layoutModel.setMetrics(m_contentWidth, m_contentHeight);
 }
 
 void PagedEditorWidget::relayoutDocument()
@@ -1565,260 +1328,14 @@ void PagedEditorWidget::relayoutDocument()
     if (!m_document)
         return;
     m_document->setDocumentMargin(0);
-    if (m_pageMode)
-        recomputePagination();
-    else
-        applyContinuousLayout();
-}
-
-void PagedEditorWidget::applyContinuousLayout()
-{
-    if (!m_document)
-        return;
-    m_document->setPageSize(QSizeF(m_contentWidth, -1));
-    (void)m_document->documentLayout()->documentSize();
-    m_pageRanges.clear();
-    m_pageRanges.append(PageRange{0.0, qMax(m_contentHeight, m_document->size().height())});
-    m_pageCount = 1;
-}
-
-void PagedEditorWidget::recomputePagination()
-{
-    if (!m_document || m_recomputingPagination)
-        return;
-    m_recomputingPagination = true;
-
-    auto *layout = m_document->documentLayout();
-    (void)layout->documentSize(); // force full layout so all line heights are valid
-
-    qreal maxLineHeight = 1.0;
-    for (QTextBlock b = m_document->begin(); b.isValid(); b = b.next()) {
-        const QTextLayout *tl = b.layout();
-        for (int i = 0; i < tl->lineCount(); ++i)
-            maxLineHeight = qMax(maxLineHeight, tl->lineAt(i).height());
-    }
-    m_maxLineHeight = maxLineHeight;
-
-    // Qt places the line that does not fit at exactly the page height, then
-    // starts the next page after it. Shrink the layout page height by the max
-    // line height so that overflowing line still ends inside the content box.
-    m_layoutPageHeight = qMax(120.0, m_contentHeight - maxLineHeight - 1.0);
-    m_document->setPageSize(QSizeF(m_contentWidth, m_layoutPageHeight));
-    (void)layout->documentSize();
-
-    // Attribute every LINE to a page by its actual doc-y position. Qt clamps
-    // the first line that does not fit to exactly the layout page height, so
-    // that line lands on the next page here — the same behavior as Word
-    // pushing a line that does not fit to the next page.
-    QVector<qreal> minTop;
-    QVector<qreal> maxBottom;
-    QVector<int> startBlocks;
-    for (QTextBlock b = m_document->begin(); b.isValid(); b = b.next()) {
-        const QRectF br = layout->blockBoundingRect(b);
-        if (!br.isValid())
-            continue;
-        const QTextLayout *tl = b.layout();
-        for (int i = 0; i < tl->lineCount(); ++i) {
-            const QTextLine ln = tl->lineAt(i);
-            const qreal top = br.top() + ln.y();
-            const int page = qMax(0, int(std::floor(top / m_layoutPageHeight)));
-            while (minTop.size() <= page) {
-                minTop.append(std::numeric_limits<qreal>::max());
-                maxBottom.append(std::numeric_limits<qreal>::lowest());
-            }
-            minTop[page] = qMin(minTop[page], top);
-            maxBottom[page] = qMax(maxBottom[page], top + ln.height());
-            if (startBlocks.size() <= page)
-                startBlocks.resize(page + 1, b.blockNumber());
-        }
-    }
-
-    m_pageRanges.clear();
-    if (minTop.isEmpty()) {
-        m_pageRanges.append(PageRange{0.0, m_contentHeight});
-    } else {
-        m_pageRanges.reserve(minTop.size());
-        for (int i = 0; i < minTop.size(); ++i)
-            m_pageRanges.append(PageRange{minTop.at(i),
-                                          qMax(minTop.at(i) + 1.0, maxBottom.at(i))});
-    }
-    m_pageCount = m_pageRanges.size();
-    m_pageStartBlocks = startBlocks;
-    m_rangeBuiltToPage = m_pageCount - 1;
-    m_rebuildBlock = -1;
-    m_maxLineHeightDirty = false;
-    m_lastChangePos = -1;
-    m_recomputingPagination = false;
-}
-
-void PagedEditorWidget::markDirty(int position)
-{
-    if (!m_document)
-        return;
-    const QTextBlock b = m_document->findBlock(position);
-    const int bn = b.isValid() ? b.blockNumber() : 0;
-    m_rebuildBlock = (m_rebuildBlock < 0) ? bn : qMin(m_rebuildBlock, bn);
-
-    // Pages before the block's page are untouched; everything from that page on
-    // must be re-walked. pageStartBlocks is still valid up to the old built page.
-    int page = 0;
-    for (int i = 0; i < m_pageStartBlocks.size(); ++i) {
-        const int sb = m_pageStartBlocks.at(i);
-        if (sb >= 0 && sb <= bn)
-            page = i;
-        else
-            break;
-    }
-    // The edit page's end is now unknown — reset it so the rebuild does not
-    // keep a stale (possibly too large) end after deletions.
-    if (page < m_pageRanges.size())
-        m_pageRanges[page].end = m_pageRanges[page].start;
-    m_rangeBuiltToPage = qMin(m_rangeBuiltToPage, page - 1);
-}
-
-void PagedEditorWidget::ensurePageRangeSize(int pageIndex) const
-{
-    if (m_pageRanges.size() <= pageIndex)
-        m_pageRanges.resize(pageIndex + 1, PageRange{0.0, 0.0});
-}
-
-void PagedEditorWidget::ensureRangesThroughPage(int pageIndex) const
-{
-    if (!m_document || !m_pageMode)
-        return;
-    if (m_maxLineHeightDirty) {
-        if (!m_recomputingPagination)
-            const_cast<PagedEditorWidget *>(this)->recomputePagination();
-        return;
-    }
-    if (m_rebuildBlock < 0 || pageIndex <= m_rangeBuiltToPage)
-        return;
-
-    auto *layout = m_document->documentLayout();
-    const int startPage = qMax(0, m_rangeBuiltToPage + 1);
-    int blockNum = m_rebuildBlock;
-    int page = startPage;
-    qreal minTop = std::numeric_limits<qreal>::max();
-    qreal maxBottom = std::numeric_limits<qreal>::lowest();
-    const bool editInFirstBlock =
-        blockNum <= (page < m_pageStartBlocks.size() ? m_pageStartBlocks.at(page) : -1);
-    if (!editInFirstBlock && page < m_pageRanges.size())
-        minTop = m_pageRanges.at(page).start;
-
-    m_recomputingPagination = true;
-    auto finishCurrentPage = [&]() -> bool {
-        if (minTop >= std::numeric_limits<qreal>::max()) {
-            // The page turned out empty / start moved — safe full pass.
-            m_recomputingPagination = false;
-            const_cast<PagedEditorWidget *>(this)->recomputePagination();
-            return false;
-        }
-        ensurePageRangeSize(page);
-        m_pageRanges[page].end = qMax(m_pageRanges[page].end, maxBottom);
-        if (page == startPage) {
-            if (editInFirstBlock)
-                m_pageRanges[page].start = minTop;
-            else
-                m_pageRanges[page].start = qMin(m_pageRanges[page].start, minTop);
-        }
-        if (m_pageStartBlocks.size() <= page)
-            m_pageStartBlocks.resize(page + 1, -1);
-        if (page > startPage || m_pageStartBlocks.at(page) < 0)
-            m_pageStartBlocks[page] = blockNum;
-        return true;
-    };
-
-    while (blockNum < m_document->blockCount()) {
-        const QTextBlock b = m_document->findBlockByNumber(blockNum);
-        const QRectF br = layout->blockBoundingRect(b);
-        const QTextLayout *tl = b.layout();
-        for (int i = 0; i < tl->lineCount(); ++i) {
-            const QTextLine ln = tl->lineAt(i);
-            const qreal top = br.top() + ln.y();
-            const int lp = qMax(0, int(std::floor(top / m_layoutPageHeight)));
-            const qreal bottom = top + ln.height();
-            if (lp < page) {
-                if (lp != page - 1) {
-                    // Content moved onto a much earlier page (large delete) —
-                    // safe path: full pass.
-                    m_recomputingPagination = false;
-                    const_cast<PagedEditorWidget *>(this)->recomputePagination();
-                    return;
-                }
-                // Boundary off-by-one: the first walked line sits on the page
-                // before the expected start (a block straddles the break).
-                // Back up one page and rebuild its end from the walk.
-                page = lp;
-                maxBottom = std::numeric_limits<qreal>::lowest();
-                if (page < m_pageRanges.size())
-                    m_pageRanges[page].end = m_pageRanges[page].start;
-            }
-            if (lp > page) {
-                if (!finishCurrentPage())
-                    return;
-                if (lp > page + 1) {
-                    // Empty pages in between — drop them.
-                    m_pageRanges.resize(page + 1);
-                    m_pageStartBlocks.resize(qMax(0, page));
-                }
-                page = lp;
-                minTop = top;
-                maxBottom = bottom;
-                ensurePageRangeSize(page);
-                m_pageRanges[page].start = top;
-                if (page > pageIndex) {
-                    if (m_pageStartBlocks.size() <= page)
-                        m_pageStartBlocks.resize(page + 1, -1);
-                    m_pageStartBlocks[page] = blockNum;
-                    m_pageCount = qMax(m_pageCount, page + 1);
-                    m_rangeBuiltToPage = pageIndex;
-                    m_rebuildBlock = blockNum; // continue from this block next time
-                    m_recomputingPagination = false;
-                    const_cast<PagedEditorWidget *>(this)->updateScrollBar();
-                    return;
-                }
-            } else {
-                minTop = qMin(minTop, top);
-                maxBottom = qMax(maxBottom, bottom);
-            }
-        }
-        ++blockNum;
-    }
-
-    // Reached the end of the document: everything is accurate now.
-    if (minTop >= std::numeric_limits<qreal>::max()) {
-        m_recomputingPagination = false;
-        const_cast<PagedEditorWidget *>(this)->recomputePagination();
-        return;
-    }
-    if (!finishCurrentPage())
-        return;
-    m_pageRanges.resize(page + 1);
-    m_pageStartBlocks.resize(page + 1);
-    m_pageCount = page + 1;
-    m_rangeBuiltToPage = page;
-    m_rebuildBlock = -1;
-    m_recomputingPagination = false;
-    const_cast<PagedEditorWidget *>(this)->updateScrollBar();
-}
-
-int PagedEditorWidget::pageIndexForDocY(qreal docY) const
-{
-    if (m_pageRanges.isEmpty())
-        return 0;
-    int idx = 0;
-    for (int i = 0; i < m_pageRanges.size(); ++i) {
-        if (docY >= m_pageRanges.at(i).start)
-            idx = i;
-        else
-            break;
-    }
-    return qBound(0, idx, m_pageRanges.size() - 1);
+    m_layoutModel.setContinuous(!m_pageMode);
+    m_layoutModel.relayout();
+    updatePageCount();
 }
 
 void PagedEditorWidget::updatePageCount()
 {
-    m_pageCount = qMax(1, m_pageRanges.size());
+    m_pageCount = qMax(1, m_layoutModel.pageCount());
 }
 
 void PagedEditorWidget::updateScrollBar()
@@ -1830,8 +1347,8 @@ void PagedEditorWidget::updateScrollBar()
                  + qMax(0, m_pageCount - 1) * m_gap)
                 * f;
     } else {
-        const qreal contentH = m_pageRanges.isEmpty() ? m_contentHeight
-                                                      : m_pageRanges.first().end;
+        const qreal contentH = m_layoutModel.ranges().isEmpty() ? m_contentHeight
+                                                      : m_layoutModel.ranges().first().end;
         total = (2 * m_topPad + qMax(1.0, contentH)) * f;
     }
     m_vScroll->setRange(0, qMax(0, int(total) - height()));
@@ -1859,8 +1376,8 @@ QRectF PagedEditorWidget::pageRectInWidget(int pageIndex) const
     if (!m_pageMode) {
         const qreal w = m_pageWidth * f;
         const qreal x = qMax(0.0, (width() - w) / 2.0);
-        const qreal h = qMax(1.0, (m_pageRanges.isEmpty() ? m_contentHeight
-                                                          : m_pageRanges.first().end))
+        const qreal h = qMax(1.0, (m_layoutModel.ranges().isEmpty() ? m_contentHeight
+                                                          : m_layoutModel.ranges().first().end))
                         * f;
         return QRectF(x, -m_vScroll->value(), w, h);
     }
@@ -1875,8 +1392,8 @@ QRectF PagedEditorWidget::contentRectInWidget(int pageIndex) const
     const QRectF pr = pageRectInWidget(pageIndex);
     const qreal f = zoomScale();
     if (!m_pageMode) {
-        const qreal h = qMax(1.0, (m_pageRanges.isEmpty() ? m_contentHeight
-                                                          : m_pageRanges.first().end))
+        const qreal h = qMax(1.0, (m_layoutModel.ranges().isEmpty() ? m_contentHeight
+                                                          : m_layoutModel.ranges().first().end))
                         * f;
         return QRectF(pr.left() + m_contentLeft, pr.top() + m_contentTop,
                       m_contentWidth * f, h);
@@ -1901,10 +1418,10 @@ QPointF PagedEditorWidget::documentPointAt(const QPoint &widgetPos) const
 {
     const qreal f = zoomScale();
     const int k = pageIndexAt(widgetPos);
-    ensureRangesThroughPage(k);
+    m_layoutModel.ensureRangesThroughPage(k);
     const QRectF cr = contentRectInWidget(k);
     const qreal x = qBound(0.0, (widgetPos.x() - cr.left()) / f, m_contentWidth);
-    const PageRange range = m_pageRanges.at(k);
+    const PageRange range = m_layoutModel.ranges().at(k);
     const qreal y = range.start
                     + qBound(0.0, (widgetPos.y() - cr.top()) / f,
                              range.end - range.start);
@@ -1937,7 +1454,7 @@ void PagedEditorWidget::setCursorFromWidget(const QPoint &widgetPos, bool keepAn
 
 void PagedEditorWidget::drawPage(QPainter *painter, int pageIndex)
 {
-    ensureRangesThroughPage(pageIndex);
+    m_layoutModel.ensureRangesThroughPage(pageIndex);
     const QRectF pr = pageRectInWidget(pageIndex);
     if (!pr.intersects(rect()))
         return;
@@ -1976,11 +1493,11 @@ void PagedEditorWidget::drawPage(QPainter *painter, int pageIndex)
     painter->translate(cr.topLeft());
     painter->scale(f, f);
     // The layout stacks pages continuously with page k starting at
-    // m_pageRanges[k].start; shift so this page's content lands in its box.
-    painter->translate(0, -m_pageRanges.at(pageIndex).start);
+    // m_layoutModel.ranges()[k].start; shift so this page's content lands in its box.
+    painter->translate(0, -m_layoutModel.ranges().at(pageIndex).start);
 
     QAbstractTextDocumentLayout::PaintContext ctx;
-    const PageRange range = m_pageRanges.at(pageIndex);
+    const PageRange range = m_layoutModel.ranges().at(pageIndex);
     ctx.clip = QRectF(0, range.start, m_contentWidth, range.end - range.start);
     ctx.palette = palette();
     if (m_cursor.hasSelection()) {
@@ -2007,7 +1524,7 @@ void PagedEditorWidget::drawPage(QPainter *painter, int pageIndex)
 
     if (m_pageMode)
         paintGridLines(painter, cr);
-    paintFloatingBoxes(painter, pageIndex);
+    m_floatBoxes.paint(painter, pageIndex, zoomScale(), palette());
 }
 
 void PagedEditorWidget::drawHeaderFooter(QPainter *painter, int pageIndex,
@@ -2110,8 +1627,8 @@ void PagedEditorWidget::insertPreedit(const QString &text)
 
 void PagedEditorWidget::scrollBy(int deltaY)
 {
-    if (m_boxEditor && m_boxEditor->isVisible())
-        commitBoxEditor();
+    if (m_floatBoxes.editorVisible())
+        m_floatBoxes.commitEditor();
     m_vScroll->setValue(m_vScroll->value() + deltaY);
 }
 
@@ -2146,7 +1663,8 @@ void PagedEditorWidget::afterCursorMove()
 void PagedEditorWidget::afterDocumentChange()
 {
     if (!m_pageMode) {
-        applyContinuousLayout();
+        m_layoutModel.setContinuous(true);
+        m_layoutModel.applyContinuous();
         updatePageCount();
         updateScrollBar();
         update();
@@ -2162,11 +1680,12 @@ void PagedEditorWidget::afterDocumentChange()
     }
     m_burstHasChars = false;
     m_burstHasFormatOnly = false;
-    markDirty(m_lastChangePos);
+    m_layoutModel.markDirty(m_lastChangePos);
     m_lastChangePos = -1;
     if (m_fullPassTimer)
         m_fullPassTimer->start(); // debounced full pass for exact page count/scrollbar
     (void)currentPageIndex();     // rebuilds ranges through the caret page immediately
+    updatePageCount();
     updateScrollBar();
     updateEditRegion();
 }

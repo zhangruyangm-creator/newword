@@ -3,6 +3,8 @@
 
 #include "floatingtextbox.h"
 #include "headerfootersettings.h"
+#include "pagedfloatingboxes.h"
+#include "pagedocumentlayout.h"
 #include "pagelayout.h"
 
 #include <QHash>
@@ -147,21 +149,10 @@ protected:
     void dragEnterEvent(QDragEnterEvent *event) override;
     void dragMoveEvent(QDragMoveEvent *event) override;
     void dropEvent(QDropEvent *event) override;
-    bool eventFilter(QObject *watched, QEvent *event) override;
 
 private:
     void updateMetrics();
     void relayoutDocument();
-    //! Qt lays the last overflowing line of a page exactly at the page height,
-    //! so pages are not on a uniform grid. We paginate with a reduced layout
-    //! page height and compute each page's real doc-y range from block rects.
-    void recomputePagination();
-    //! Incremental pagination: after a text edit only the affected page(s) are
-    //! rebuilt on demand; a debounced full pass keeps page count / scrollbar exact.
-    void markDirty(int position);
-    void ensureRangesThroughPage(int pageIndex) const;
-    void ensurePageRangeSize(int pageIndex) const;
-    [[nodiscard]] int pageIndexForDocY(qreal docY) const;
     void updateScrollBar();
     void updatePageCount();
 
@@ -188,19 +179,11 @@ private:
     void resetCursorBlink();
     void afterCursorMove();
     void afterDocumentChange();
-    void applyContinuousLayout();
     void updateEditRegion();
-    void paintFloatingBoxes(QPainter *painter, int pageIndex);
-    [[nodiscard]] int hitTestFloatingBox(const QPoint &widgetPos) const;
-    [[nodiscard]] QRectF floatBoxRectInWidget(const FloatingTextBox &box) const;
-    [[nodiscard]] int indexOfFloatingBox(const QString &id) const;
-    void saveFloatingBoxes();
-    void openBoxEditor(const QString &id);
-    void commitBoxEditor();
-    void closeBoxEditor();
     [[nodiscard]] qreal zoomScale() const;
 
     QTextDocument *m_document = nullptr;
+    PagedDocumentLayout m_layoutModel; //!< pagination model (ranges / incremental)
     PageLayoutSettings m_layout;
     HeaderFooterSettings m_headerFooter;
     QTextCursor m_cursor;
@@ -220,13 +203,11 @@ private:
     bool m_acceptRichText = true;
     bool m_pageMode = true;
     bool m_lastHadSelection = false;
-    bool m_maxLineHeightDirty = true;
     bool m_burstHasChars = false;
     bool m_burstHasFormatOnly = false;
     int m_preeditLength = 0;
     int m_zoomPercent = 100;
     int m_lastChangePos = -1;
-    mutable int m_rebuildBlock = -1; //!< first stale block; -1 = ranges fully accurate
 
     qreal m_pageWidth = 0;
     qreal m_pageHeight = 0;
@@ -234,30 +215,11 @@ private:
     qreal m_contentTop = 0;
     qreal m_contentWidth = 0;
     qreal m_contentHeight = 0;
-    qreal m_layoutPageHeight = 0;
-    qreal m_maxLineHeight = 1;
     qreal m_gap = 28;
     qreal m_topPad = 24;
     mutable int m_pageCount = 1;
-    mutable bool m_recomputingPagination = false;
 
-    struct PageRange {
-        qreal start = 0;
-        qreal end = 0;
-    };
-    mutable QVector<PageRange> m_pageRanges;
-    mutable QVector<int> m_pageStartBlocks; //!< first block number per page
-    mutable int m_rangeBuiltToPage = -1;    //!< pages [0..this] are accurate
-
-    QVector<FloatingTextBox> m_floatBoxes;
-    QHash<QString, QTextDocument *> m_floatBoxDocs;
-    QString m_selectedBoxId;
-    QString m_editingBoxId;
-    class QTextEdit *m_boxEditor = nullptr;
-    FloatingTextBox m_boxDragOrig;
-    QPoint m_boxDragStart;
-    bool m_boxDragMove = false;
-    bool m_boxDragResize = false;
+    PagedFloatingBoxes m_floatBoxes;
 
     bool m_showGrid = false;
     int m_gridSpacingPx = 19; //!< 5 mm at 100% zoom

@@ -88,6 +88,12 @@ set(PROJECT_SOURCES
     webpimage.mm
     pagededitorwidget.h
     pagededitorwidget.cpp
+    pagedocumentlayout.h
+    pagedocumentlayout.cpp
+    pagedimageobject.h
+    pagedimageobject.cpp
+    pagedfloatingboxes.h
+    pagedfloatingboxes.cpp
     editorwidget.h
     editorwidget.cpp
     documenttab.h
@@ -133,8 +139,6 @@ set(PROJECT_SOURCES
     documentviewmode.h
     editorviewlayout.h
     editorviewlayout.cpp
-    floatingtextboxlayer.h
-    floatingtextboxlayer.cpp
     spellchecker.h
     spellchecker.mm
     spellhighlighter.h
@@ -211,11 +215,21 @@ qt_finalize_executable(NewWord)
 # --- Unit / smoke tests (PageGeometry + builtin DOCX round-trip) ---
 enable_testing()
 qt_add_executable(NewWordCoreTests
-    tests/tst_coresmoke.cpp
+    tests/coresmoke.h
+    tests/tst_coresmoke_main.cpp
+    tests/tst_coresmoke_docx.cpp
+    tests/tst_coresmoke_engine.cpp
+    tests/tst_coresmoke_editor.cpp
     appstyle.h
     appstyle.cpp
     pagededitorwidget.h
     pagededitorwidget.cpp
+    pagedocumentlayout.h
+    pagedocumentlayout.cpp
+    pagedimageobject.h
+    pagedimageobject.cpp
+    pagedfloatingboxes.h
+    pagedfloatingboxes.cpp
     ${NEWWORD_CORE_SOURCES}
     ${NEWWORD_LAYOUT_PAINTER_SOURCES}
     headerfootersettings.h
@@ -240,6 +254,9 @@ target_link_libraries(NewWordCoreTests PRIVATE
     z
 )
 add_test(NAME NewWordCoreTests COMMAND NewWordCoreTests)
+set_tests_properties(NewWordCoreTests PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
+)
 
 # DocumentTab smoke: the self-drawn editor inside the real tab (view switching,
 # typing, rendering) without launching the whole app.
@@ -250,6 +267,12 @@ qt_add_executable(NewWordDocTabSmokeTests
     documenttab_io.cpp
     pagededitorwidget.h
     pagededitorwidget.cpp
+    pagedocumentlayout.h
+    pagedocumentlayout.cpp
+    pagedimageobject.h
+    pagedimageobject.cpp
+    pagedfloatingboxes.h
+    pagedfloatingboxes.cpp
     appstyle.h
     appstyle.cpp
     documentrecovery.h
@@ -301,6 +324,12 @@ qt_add_executable(NewWordBenchEditorPerf
     appstyle.cpp
     pagededitorwidget.h
     pagededitorwidget.cpp
+    pagedocumentlayout.h
+    pagedocumentlayout.cpp
+    pagedimageobject.h
+    pagedimageobject.cpp
+    pagedfloatingboxes.h
+    pagedfloatingboxes.cpp
     ${NEWWORD_CORE_SOURCES}
     headerfootersettings.h
     headerfootersettings.cpp
@@ -318,6 +347,12 @@ qt_add_executable(NewWordRenderPagedPreview
     appstyle.cpp
     pagededitorwidget.h
     pagededitorwidget.cpp
+    pagedocumentlayout.h
+    pagedocumentlayout.cpp
+    pagedimageobject.h
+    pagedimageobject.cpp
+    pagedfloatingboxes.h
+    pagedfloatingboxes.cpp
     ${NEWWORD_CORE_SOURCES}
     headerfootersettings.h
     headerfootersettings.cpp
