@@ -33,6 +33,9 @@ jobs:
       - name: Install ccache
         run: brew install ccache
 
+      - name: Install minizip-ng, libwebp and hunspell
+        run: brew install minizip-ng webp hunspell
+
       - name: Cache ccache
         uses: actions/cache@v4
         with:

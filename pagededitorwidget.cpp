@@ -1720,8 +1720,6 @@ void PagedEditorWidget::setPageLayout(const PageLayoutSettings &layout)
     emit pageGeometryChanged();
 }
 
-#include "pagededitorwidget.moc"
-
 void PagedEditorWidget::setHeaderFooter(const HeaderFooterSettings &settings)
 {
     m_headerFooter = settings;

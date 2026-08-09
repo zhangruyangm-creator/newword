@@ -3,6 +3,7 @@
 #include "formulaio.h"
 #include "pagegeometry.h"
 #include "pagededitorwidget.h"
+#include "spellchecker.h"
 #include "webpimage.h"
 
 #include <QApplication>
@@ -24,6 +25,7 @@ private slots:
     void viewSwitchAndTyping();
     void widgetSetHtmlKeepsParagraphs();
     void webpLoads();
+    void spellCheckWithHunspell();
     void formulaInsertAlignAndDoubleClick();
 };
 
@@ -104,6 +106,35 @@ void DocumentTabSmokeTest::webpLoads()
     const QColor c = image.pixelColor(1, 1);
     QVERIFY2(qAbs(c.red() - 255) < 40 && qAbs(c.green() - 80) < 40,
              qPrintable(QStringLiteral("red=%1 green=%2").arg(c.red()).arg(c.green())));
+}
+
+void DocumentTabSmokeTest::spellCheckWithHunspell()
+{
+    QVERIFY2(SpellChecker::isAvailable(), "en_US dictionary must load");
+    SpellChecker::clearCache();
+
+    // Common words must pass.
+    QVERIFY(!SpellChecker::isMisspelled(QStringLiteral("the")));
+    QVERIFY(!SpellChecker::isMisspelled(QStringLiteral("hello")));
+    QVERIFY(!SpellChecker::isMisspelled(QStringLiteral("computer")));
+
+    // Deliberate typos must be flagged.
+    QVERIFY(SpellChecker::isMisspelled(QStringLiteral("worlx")));
+    QVERIFY(SpellChecker::isMisspelled(QStringLiteral("speling")));
+
+    // Non-latin / too-short words are skipped by the filter, never "flagged".
+    QVERIFY(!SpellChecker::isMisspelled(QStringLiteral("中文")));
+    QVERIFY(!SpellChecker::isMisspelled(QStringLiteral("a")));
+
+    // Suggestions for a known typo must include the intended word.
+    const QStringList guesses = SpellChecker::suggestions(QStringLiteral("speling"));
+    QVERIFY2(guesses.contains(QStringLiteral("spelling")),
+             qPrintable(QStringLiteral("guesses=%1").arg(guesses.join(QLatin1Char(',')))));
+
+    // Cache must keep behaving correctly after clearCache().
+    SpellChecker::clearCache();
+    QVERIFY(!SpellChecker::isMisspelled(QStringLiteral("the")));
+    QVERIFY(SpellChecker::isMisspelled(QStringLiteral("worlx")));
 }
 
 void DocumentTabSmokeTest::formulaInsertAlignAndDoubleClick()

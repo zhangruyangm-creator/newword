@@ -68,7 +68,7 @@ NewWord 的存在理由很简单：**现代办公套件越来越臃肿**——�
 - **分页编辑器**：打字走增量分页（只重排光标页附近），停止输入 120ms 后补齐精确页数与滚动条，打字期间页码/页脚为估算值；与 PDF 行边界可能有细微差别。超长单段落文档（HTML 导入）会自动规范化重建，避免编辑开销退化为 O(n)；图片资源加载时自动降采样（最长边 ≤2048px），重绘走像素图缓存
 - **网格线**：页面视图可显示 5mm 辅助网格（视图菜单开关）
 - **页眉页脚**：通过对话框编辑，分页编辑器按设置绘制在每页；首页不同/奇偶页以对话框为准。DOCX 读写为纯文本 + PAGE 域
-- 当前面向 **macOS**（拼写检查、PDF 预览依赖系统框架）
+- 当前面向 **macOS**（PDF 预览依赖系统框架；拼写检查用内置 Hunspell + en_US 词典，可跨平台）
 
 ## DOCX 主路径
 
@@ -91,7 +91,15 @@ NewWord 的存在理由很简单：**现代办公套件越来越臃肿**——�
 
 ## 构建与测试
 
-依赖：Qt 6.11+（Widgets + PrintSupport）、macOS、zlib。可选：Python 3 + venv（DOCX 增强）。
+依赖：Qt 6.11+（Widgets + PrintSupport）、macOS、zlib。第三方库：**minizip-ng**（DOCX 的 ZIP 读写）、**libwebp**（WebP 图片解码）、**Hunspell**（拼写检查），macOS 上可用 Homebrew 安装：
+
+```bash
+brew install minizip-ng webp hunspell
+```
+
+词典（en_US.aff/.dic，MIT 许可）已随仓库打包在 `resources/dictionaries/`，构建时自动复制进 App Bundle 的 `Resources/dictionaries`；运行时也可通过 `HUNSPELL_DICT_PATH` 环境变量指定自定义词典目录。
+
+可选：Python 3 + venv（DOCX 增强）。
 
 ```bash
 # 开发构建
@@ -127,6 +135,7 @@ CI（GitHub Actions）：macOS 上自动构建测试 target、跑 ctest 与编�
 
 - 分页评测：[`docs/pagination_eval.md`](docs/pagination_eval.md)（Δ活页=0；几何估算短样例 ±1 / 长文·图·多页表 ±3）
 - 毕设第 4～5 章提纲：[`docs/thesis_ch4_ch5_outline.md`](docs/thesis_ch4_ch5_outline.md)（v2：自绘分页编辑器 + 增量分页 + 性能评测）
+- 毕设第 4～5 章正文：[`docs/thesis_ch4_ch5_body.md`](docs/thesis_ch4_ch5_body.md)（4 章：布局引擎与自绘分页编辑器设计；5 章：实验评测与结果分析）
 
 > 说明：`pagination_eval.md` 是早期「引擎驱动活页页数」方案的评测（阶段 1 成果）；当前编辑视图已改为 QTextDocument 自绘分页，页数口径与导出不同源，详细修订见论文提纲 5.5。
 

@@ -13,6 +13,34 @@ set(CMAKE_AUTORCC ON)
 
 find_package(Qt6 REQUIRED COMPONENTS Widgets PrintSupport Concurrent Test)
 
+# Third-party dependencies (brew install minizip-ng webp)
+find_package(minizip-ng REQUIRED)
+
+# libwebp — Qt's bundled image formats lack WebP.
+find_path(WEBP_INCLUDE_DIR NAMES webp/decode.h)
+find_library(WEBP_LIBRARY NAMES webp)
+if(NOT WEBP_INCLUDE_DIR OR NOT WEBP_LIBRARY)
+    message(FATAL_ERROR "libwebp not found — install with: brew install webp")
+endif()
+add_library(NewWordWebP UNKNOWN IMPORTED)
+set_target_properties(NewWordWebP PROPERTIES
+    IMPORTED_LOCATION "${WEBP_LIBRARY}"
+    INTERFACE_INCLUDE_DIRECTORIES "${WEBP_INCLUDE_DIR}"
+)
+
+# Hunspell — spell checking (system NSSpellChecker was macOS-only).
+find_path(HUNSPELL_INCLUDE_DIR NAMES hunspell/hunspell.hxx)
+find_library(HUNSPELL_LIBRARY NAMES hunspell-1.7 hunspell)
+if(NOT HUNSPELL_INCLUDE_DIR OR NOT HUNSPELL_LIBRARY)
+    message(FATAL_ERROR "Hunspell not found — install with: brew install hunspell")
+endif()
+add_library(NewWordHunspell UNKNOWN IMPORTED)
+set_target_properties(NewWordHunspell PROPERTIES
+    IMPORTED_LOCATION "${HUNSPELL_LIBRARY}"
+    INTERFACE_INCLUDE_DIRECTORIES "${HUNSPELL_INCLUDE_DIR}"
+)
+set(NEWWORD_DICT_DIR "${CMAKE_SOURCE_DIR}/resources/dictionaries")
+
 set(NEWWORD_ENGINE_SOURCES
     engine/documentmodel.h
     engine/documentmodel.cpp
@@ -85,7 +113,7 @@ set(PROJECT_SOURCES
     mainwindow_table.cpp
     mainwindow_view.cpp
     webpimage.h
-    webpimage.mm
+    webpimage.cpp
     pagededitorwidget.h
     pagededitorwidget.cpp
     pagedocumentlayout.h
@@ -140,7 +168,7 @@ set(PROJECT_SOURCES
     editorviewlayout.h
     editorviewlayout.cpp
     spellchecker.h
-    spellchecker.mm
+    spellchecker.cpp
     spellhighlighter.h
     spellhighlighter.cpp
     pdfviewtab.h
@@ -165,6 +193,9 @@ target_link_libraries(NewWord PRIVATE
     Qt6::Widgets
     Qt6::PrintSupport
     Qt6::Concurrent
+    MINIZIP::minizip-ng
+    NewWordWebP
+    NewWordHunspell
     "-framework ImageIO"
     z
     "-framework AppKit"
@@ -173,6 +204,7 @@ target_link_libraries(NewWord PRIVATE
 
 target_compile_definitions(NewWord PRIVATE
     NEWWORD_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+    NEWWORD_DICT_DIR="${NEWWORD_DICT_DIR}"
 )
 
 add_custom_command(TARGET NewWord POST_BUILD
@@ -184,7 +216,15 @@ add_custom_command(TARGET NewWord POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_SOURCE_DIR}/tools/docx_bridge/requirements.txt"
             "$<TARGET_FILE_DIR:NewWord>/../Resources/docx_bridge/requirements.txt"
-    COMMENT "Bundle DOCX bridge script into app Resources"
+    COMMAND ${CMAKE_COMMAND} -E make_directory
+            "$<TARGET_FILE_DIR:NewWord>/../Resources/dictionaries"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${NEWWORD_DICT_DIR}/en_US.aff"
+            "$<TARGET_FILE_DIR:NewWord>/../Resources/dictionaries/en_US.aff"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${NEWWORD_DICT_DIR}/en_US.dic"
+            "$<TARGET_FILE_DIR:NewWord>/../Resources/dictionaries/en_US.dic"
+    COMMENT "Bundle DOCX bridge script and dictionary into app Resources"
 )
 
 # Optional: keep a project-local venv for the DOCX bridge (mammoth/html2docx).
@@ -251,6 +291,7 @@ target_link_libraries(NewWordCoreTests PRIVATE
     Qt6::Gui
     Qt6::Widgets
     Qt6::PrintSupport
+    MINIZIP::minizip-ng
     z
 )
 add_test(NAME NewWordCoreTests COMMAND NewWordCoreTests)
@@ -284,7 +325,7 @@ qt_add_executable(NewWordDocTabSmokeTests
     outlineviewwidget.h
     outlineviewwidget.cpp
     spellchecker.h
-    spellchecker.mm
+    spellchecker.cpp
     spellhighlighter.h
     spellhighlighter.cpp
     docxconverter.h
@@ -292,7 +333,7 @@ qt_add_executable(NewWordDocTabSmokeTests
     headerfootersettings.h
     headerfootersettings.cpp
     webpimage.h
-    webpimage.mm
+    webpimage.cpp
     ${NEWWORD_CORE_SOURCES}
 )
 target_include_directories(NewWordDocTabSmokeTests PRIVATE
@@ -301,6 +342,7 @@ target_include_directories(NewWordDocTabSmokeTests PRIVATE
 )
 target_compile_definitions(NewWordDocTabSmokeTests PRIVATE
     NEWWORD_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+    NEWWORD_DICT_DIR="${NEWWORD_DICT_DIR}"
 )
 target_link_libraries(NewWordDocTabSmokeTests PRIVATE
     Qt6::Test
@@ -308,6 +350,9 @@ target_link_libraries(NewWordDocTabSmokeTests PRIVATE
     Qt6::Widgets
     Qt6::PrintSupport
     Qt6::Concurrent
+    MINIZIP::minizip-ng
+    NewWordWebP
+    NewWordHunspell
     "-framework ImageIO"
     z
     "-framework AppKit"
@@ -338,7 +383,7 @@ target_include_directories(NewWordBenchEditorPerf PRIVATE
     ${CMAKE_SOURCE_DIR}
     ${CMAKE_SOURCE_DIR}/engine
 )
-target_link_libraries(NewWordBenchEditorPerf PRIVATE Qt6::Gui Qt6::Widgets z)
+target_link_libraries(NewWordBenchEditorPerf PRIVATE Qt6::Gui Qt6::Widgets MINIZIP::minizip-ng z)
 
 # Visual QA tool for the self-drawn paged editor (renders to a PNG offscreen).
 qt_add_executable(NewWordRenderPagedPreview
@@ -361,7 +406,7 @@ target_include_directories(NewWordRenderPagedPreview PRIVATE
     ${CMAKE_SOURCE_DIR}
     ${CMAKE_SOURCE_DIR}/engine
 )
-target_link_libraries(NewWordRenderPagedPreview PRIVATE Qt6::Gui Qt6::Widgets z)
+target_link_libraries(NewWordRenderPagedPreview PRIVATE Qt6::Gui Qt6::Widgets MINIZIP::minizip-ng z)
 
 # Layout performance micro-benchmark (Adapter / Engine / Fast path)
 qt_add_executable(NewWordBenchLayoutPerf tools/bench_layout_perf.cpp ${NEWWORD_CORE_SOURCES})
@@ -369,7 +414,7 @@ target_include_directories(NewWordBenchLayoutPerf PRIVATE
     ${CMAKE_SOURCE_DIR}
     ${CMAKE_SOURCE_DIR}/engine
 )
-target_link_libraries(NewWordBenchLayoutPerf PRIVATE Qt6::Gui Qt6::Widgets z)
+target_link_libraries(NewWordBenchLayoutPerf PRIVATE Qt6::Gui Qt6::Widgets MINIZIP::minizip-ng z)
 
 # Mixed-document micro-benchmark: QTextDocument with images + tables +
 # fragmented formatting (real-world paper/report load). Independent of
@@ -384,7 +429,7 @@ target_include_directories(NewWordMakeDemo PRIVATE
     ${CMAKE_SOURCE_DIR}/engine
 )
 target_compile_definitions(NewWordMakeDemo PRIVATE NEWWORD_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
-target_link_libraries(NewWordMakeDemo PRIVATE Qt6::Gui Qt6::Widgets z)
+target_link_libraries(NewWordMakeDemo PRIVATE Qt6::Gui Qt6::Widgets MINIZIP::minizip-ng z)
 add_custom_command(TARGET NewWordMakeDemo POST_BUILD
     COMMAND "$<TARGET_FILE:NewWordMakeDemo>"
     COMMENT "Generate examples/demo.docx"
